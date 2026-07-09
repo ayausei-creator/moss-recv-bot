@@ -44,6 +44,12 @@ IMAGE_MIMES = ("image/jpeg", "image/png", "image/webp", "image/heic", "image/hei
 GREEN = 0.85
 REVIEW = 0.70
 
+# --if-requested honors a scan request only if it is newer than the last one we
+# claimed AND recent enough. The app writes epoch-ms tokens (Date.now()), which
+# are timezone-independent, so this stays correct regardless of the container's
+# timezone. Overridable via env for tuning without a redeploy.
+SCAN_FRESH_SECONDS = int(os.environ.get("M12_SCAN_FRESH_SECONDS", "3600") or "3600")
+
 
 def now_ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -423,6 +429,52 @@ def normalize_line(line, packf, canonical_unit):
 
 
 # ---------------------------------------------------------------------------
+# --if-requested trigger: claim a fresh scan request from Recv_Control
+# ---------------------------------------------------------------------------
+def claim_scan_request(dry=False):
+    # Read the single Recv_Control row (key="control"). Return the request token
+    # to run on, or None when there is nothing fresh to do. On a live run we
+    # CLAIM the request first (scan_done = scan_request) BEFORE any heavy work,
+    # so the next 1-minute tick will not re-run the same request. This is the
+    # only Sheets touch on the idle path, keeping the every-minute cron cheap.
+    ws = rc.open_ws(rc.TAB_CONTROL, rc.CONTROL_HEADERS)
+    headers, rows = rc.read_records(ws)
+    row = None
+    for r in rows:
+        if (r.get("key") or "").strip() == "control":
+            row = r
+            break
+    if not row:
+        return None
+    req = str(row.get("scan_request") or "").strip()
+    done = str(row.get("scan_done") or "").strip()
+    if not req or req == done:
+        return None  # nothing new since we last ran
+    try:
+        req_ms = int(float(req))
+    except (TypeError, ValueError):
+        req_ms = 0
+    now_ms = int(time.time() * 1000)
+    if req_ms and (now_ms - req_ms) > SCAN_FRESH_SECONDS * 1000:
+        # Stale request (e.g. the bot was down for a long time): do not surprise
+        # the manager with an old scan. Clear it so we stop re-checking.
+        rc.log("if-requested: request %s is stale (%ds old), ignored"
+               % (req, (now_ms - req_ms) // 1000))
+        if not dry:
+            rc.set_cell(ws, headers, row["_row"], "scan_done", req)
+            rc.set_cell(ws, headers, row["_row"], "note", "stale request ignored")
+            rc.set_cell(ws, headers, row["_row"], "updated_at", now_ts())
+        return None
+    if dry:
+        rc.log("if-requested (dry): would claim scan request %s" % req)
+        return req
+    rc.set_cell(ws, headers, row["_row"], "scan_done", req)
+    rc.set_cell(ws, headers, row["_row"], "note", "scan started " + now_ts())
+    rc.set_cell(ws, headers, row["_row"], "updated_at", now_ts())
+    return req
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main():
@@ -434,11 +486,24 @@ def main():
                     help="reprocess regardless of status (skips posted/posting)")
     ap.add_argument("--redo", default="",
                     help="reprocess one doc_id for re-testing (implies --doc + --force)")
+    ap.add_argument("--if-requested", action="store_true",
+                    help="light trigger (1-min cron): run only when the app set a "
+                         "fresh Recv_Control.scan_request; otherwise exit at once")
     args = ap.parse_args()
 
     if args.redo:
         args.doc = args.redo
         args.force = True
+
+    # Light trigger for the "Rozpoznaj" button: bail out immediately unless the
+    # app queued a fresh request. Checked BEFORE loading prompts / opening the
+    # data tabs / scanning Drive, so an idle every-minute run costs one tiny read.
+    if args.if_requested:
+        token = claim_scan_request(args.dry)
+        if not token:
+            rc.log("if-requested: no fresh scan request; nothing to do")
+            return 0
+        rc.log("if-requested: fresh scan request %s -> running ingest" % token)
 
     parse_prompt, match_prompt = load_prompts()
     if not parse_prompt:

@@ -60,6 +60,15 @@ TAB_SUPPLIERS = "Recv_Suppliers"
 TAB_CATALOG = "Recv_Catalog"
 TAB_KOSZT = "Recv_Koszt"
 TAB_TASKS = "Recv_Tasks"
+TAB_CONTROL = "Recv_Control"
+
+# Recv_Control - single-row control channel between the manager app and this bot.
+# The app writes scan_request (epoch ms) when the manager taps "Rozpoznaj"; the
+# trigger cron (m12_recv_ingest --if-requested) claims it by writing scan_done.
+# Epoch-ms tokens are timezone-independent, so the freshness math is safe no
+# matter what timezone the Gateway container runs in.
+CONTROL_HEADERS = ["key", "scan_request", "scan_requested_by",
+                   "scan_done", "updated_at", "note"]
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +324,26 @@ def drive_download(file_id, dest_path):
 # ---------------------------------------------------------------------------
 # LLM via `openclaw infer` (never call OpenAI/DeepSeek directly)
 # ---------------------------------------------------------------------------
+# The openclaw CLI is resolved by ABSOLUTE PATH; we never trust $PATH. Cron jobs
+# and `sh -lc` login shells routinely run with a stripped or profile-overwritten
+# PATH - the classic "works in a terminal, fails under cron" trap (the same
+# reason m12_recv_ingest resolves the poppler binaries explicitly). Order:
+# OPENCLAW_BIN env override, the known npm-global install on this Gateway, then a
+# best-effort PATH lookup as a last resort.
+def _resolve_openclaw():
+    cand = (os.environ.get("OPENCLAW_BIN") or "").strip()
+    if cand and os.path.exists(cand):
+        return cand
+    known = "/data/.npm-global/bin/openclaw"
+    if os.path.exists(known):
+        return known
+    from shutil import which
+    return which("openclaw") or "openclaw"
+
+
+OPENCLAW_BIN = _resolve_openclaw()
+
+
 def _run(cmd):
     log("run: " + " ".join(cmd[:6]) + (" ..." if len(cmd) > 6 else ""))
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -336,12 +365,12 @@ def _extract_model_json(stdout):
 
 
 def infer_text(prompt):
-    cmd = ["openclaw", "infer", "model", "run", "--prompt", prompt,
+    cmd = [OPENCLAW_BIN, "infer", "model", "run", "--prompt", prompt,
            "--model", LLM_TEXT, "--json"]
     rc, out, err = _run(cmd)
     if rc != 0:
         log("text LLM primary failed (%s), fallback. stderr: %s" % (LLM_TEXT, err[:300]))
-        cmd = ["openclaw", "infer", "model", "run", "--prompt", prompt,
+        cmd = [OPENCLAW_BIN, "infer", "model", "run", "--prompt", prompt,
                "--model", LLM_TEXT_FALLBACK, "--json"]
         rc, out, err = _run(cmd)
         if rc != 0:
@@ -350,7 +379,7 @@ def infer_text(prompt):
 
 
 def infer_vision(prompt, file_path):
-    cmd = ["openclaw", "infer", "model", "run", "--model", LLM_VISION,
+    cmd = [OPENCLAW_BIN, "infer", "model", "run", "--model", LLM_VISION,
            "--file", file_path, "--prompt", prompt, "--json"]
     rc, out, err = _run(cmd)
     if rc != 0:
@@ -382,7 +411,7 @@ def clean_msg(s):
 
 def tg(message):
     msg = clean_msg(message) or "(pusty komunikat)"
-    cmd = ["openclaw", "message", "send", "--channel", "telegram",
+    cmd = [OPENCLAW_BIN, "message", "send", "--channel", "telegram",
            "--target", TG_TARGET, "--thread-id", TG_THREAD, "--message", msg]
     rc, out, err = _run(cmd)
     if rc != 0:
