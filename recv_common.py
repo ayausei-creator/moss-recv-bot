@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+# -*- coding: ascii -*-
+# MOSS M12 recv - shared helpers for the receiving bot.
+# ASCII-only source, UTF-8 at runtime. Style follows m3_telegram_ingest.py and
+# m5_photo_verify.py: logs to stderr, --dry aware, gspread HEADER_ROW=2,
+# LLM via `openclaw infer`, Telegram via `openclaw message send`,
+# Dotypos over a tiny urllib client (based on /tmp/recv_audit.py).
+#
+# This module writes NOTHING to Dotypos by itself. The only live write lives in
+# m12_recv_post.py and is gated behind an explicit --live flag (see sec.0 of brief).
+
+import json
+import os
+import re
+import sys
+import time
+import subprocess
+import urllib.request
+import urllib.parse
+import urllib.error
+
+# ---------------------------------------------------------------------------
+# Constants (this server / this cloud). No secrets here - tokens are read from
+# files in SECRETS_DIR at runtime.
+# ---------------------------------------------------------------------------
+SECRETS_DIR = "/data/.openclaw/secrets"
+DOTY_SECRET = os.path.join(SECRETS_DIR, "dotykacka.json")
+GOOGLE_SA = os.path.join(SECRETS_DIR, "google_sa.json")
+PROMPT_FILE = os.path.join(SECRETS_DIR, "MOSS_M12_Recv_Prompt.md")
+
+RECV_SHEET_ID = "1A8Hk9ePINaI3pbwo47lfCDOX105ULW5dDghApunxjsI"
+DRIVE_WZ_INBOX_FOLDER_ID = "1bhXw-wI1xR1aYrRTssXHlKc7HqmpKhpE"
+
+DOTY_API_ROOT = "https://api.dotykacka.cz/v2"
+DOTY_CLOUD_ID = "352797827"
+DOTY_CLOUD_BASE = DOTY_API_ROOT + "/clouds/" + DOTY_CLOUD_ID
+DOTY_WAREHOUSE_ID = "144068569"  # MAGAZYN - the single warehouse
+
+# Known category ids (rest are resolved via GET /categories at runtime).
+CAT_SKLADNIKI = "1548073505771091"
+CAT_SKLEP_KAWA_HERB = "1083937491148571"
+
+# Telegram Admin sink (group + thread), same as m5.
+TG_TARGET = "-1004228327097"
+TG_THREAD = "1"
+
+# LLM models (see brief sec.2).
+LLM_VISION = "openai/gpt-5.5"
+LLM_TEXT = "deepseek/deepseek-v4-flash"
+LLM_TEXT_FALLBACK = "openai/gpt-5.5"
+
+MATCH_THRESHOLD = 0.75
+HEADER_ROW = 2  # column names live in row 2; data starts at row 3
+
+# Sheet tab names (contract with the manager app, brief sec.4).
+TAB_DOCS = "Recv_Docs"
+TAB_LINES = "Recv_Lines"
+TAB_DICT = "Recv_Dictionary"
+TAB_SUPPLIERS = "Recv_Suppliers"
+TAB_CATALOG = "Recv_Catalog"
+TAB_KOSZT = "Recv_Koszt"
+TAB_TASKS = "Recv_Tasks"
+
+
+# ---------------------------------------------------------------------------
+# logging
+# ---------------------------------------------------------------------------
+def log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    sys.stderr.write("[%s] %s\n" % (ts, msg))
+    sys.stderr.flush()
+
+
+def today_str():
+    return time.strftime("%Y-%m-%d")
+
+
+def backup_file(path):
+    # Make a dated .bak before overwriting an existing file (brief sec.2).
+    if os.path.exists(path):
+        bak = "%s.bak_%s" % (path, time.strftime("%Y%m%d"))
+        try:
+            with open(path, "rb") as src, open(bak, "wb") as dst:
+                dst.write(src.read())
+            log("backup: %s -> %s" % (path, bak))
+        except Exception as e:
+            log("backup failed for %s: %s" % (path, e))
+
+
+# ---------------------------------------------------------------------------
+# Dotypos client (read-only helpers + a gated write). urllib only.
+# ---------------------------------------------------------------------------
+class Doty(object):
+    def __init__(self):
+        with open(DOTY_SECRET, "r") as f:
+            sec = json.load(f)
+        self.refresh_token = sec["refresh_token"]
+        self.cloud_id = str(sec.get("cloud_id", DOTY_CLOUD_ID))
+        self._token = None
+        self._token_ts = 0
+
+    def _access_token(self):
+        # Cache the access token for a few minutes.
+        if self._token and (time.time() - self._token_ts) < 300:
+            return self._token
+        body = json.dumps({"_cloudId": self.cloud_id}).encode("utf-8")
+        req = urllib.request.Request(
+            DOTY_API_ROOT + "/signin/token",
+            data=body,
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", "User " + self.refresh_token)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        self._token = data["accessToken"]
+        self._token_ts = time.time()
+        return self._token
+
+    def _request(self, method, path, body=None, etag=None):
+        # path is relative to the cloud base unless it starts with http.
+        url = path if path.startswith("http") else DOTY_CLOUD_BASE + path
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", "Bearer " + self._access_token())
+        req.add_header("Accept", "application/json")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        if etag:
+            req.add_header("If-Match", etag)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read().decode("utf-8")
+                hdrs = dict(resp.headers.items())
+                parsed = json.loads(raw) if raw.strip() else {}
+                return resp.status, parsed, hdrs
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8")
+            except Exception:
+                pass
+            raise RuntimeError("Dotypos %s %s -> HTTP %s %s"
+                               % (method, url, e.code, detail[:400]))
+
+    def get(self, path):
+        _, data, hdrs = self._request("GET", path)
+        return data, hdrs
+
+    def get_all(self, path, params=None):
+        # Handle both raw-array and {"data":[...]} responses, page from 1.
+        out = []
+        page = 1
+        while True:
+            q = dict(params or {})
+            q["page"] = page
+            q["limit"] = 100
+            sep = "&" if "?" in path else "?"
+            _, data, _ = self._request("GET", path + sep + urllib.parse.urlencode(q))
+            items = data.get("data") if isinstance(data, dict) else data
+            if not items:
+                break
+            out.extend(items)
+            if len(items) < 100:
+                break
+            page += 1
+            if page > 500:
+                log("get_all: page guard hit for %s" % path)
+                break
+        return out
+
+    def post(self, path, body, etag=None):
+        # Raw POST. Callers in m12_recv_post gate this behind --live.
+        status, data, hdrs = self._request("POST", path, body=body, etag=etag)
+        return status, data, hdrs
+
+    def put(self, path, body, etag=None):
+        status, data, hdrs = self._request("PUT", path, body=body, etag=etag)
+        return status, data, hdrs
+
+    # convenience reads used by catalog / post
+    def categories(self):
+        return self.get_all("/categories")
+
+    def products(self):
+        return self.get_all("/products")
+
+    def warehouse_products(self):
+        return self.get_all("/warehouses/" + DOTY_WAREHOUSE_ID + "/products")
+
+
+# ---------------------------------------------------------------------------
+# Google Sheets (gspread, HEADER_ROW=2)
+# ---------------------------------------------------------------------------
+_GC = None
+
+
+def gc():
+    global _GC
+    if _GC is None:
+        import gspread
+        _GC = gspread.service_account(filename=GOOGLE_SA)
+    return _GC
+
+
+def open_ws(tab, headers=None, sheet_id=RECV_SHEET_ID):
+    # Open a worksheet, creating it with a HEADER_ROW=2 layout if missing.
+    sh = gc().open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(tab)
+    except Exception:
+        ws = sh.add_worksheet(title=tab, rows=1000, cols=max(10, len(headers or []) + 2))
+    if headers:
+        cur = ws.row_values(HEADER_ROW)
+        if [h.strip() for h in cur[:len(headers)]] != headers:
+            # write column names into row 2 (row 1 stays as a human title/comment)
+            end = _col_letter(len(headers))
+            ws.update("A%d:%s%d" % (HEADER_ROW, end, HEADER_ROW), [headers])
+    return ws
+
+
+def _col_letter(n):
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def read_records(ws):
+    # Return list of dicts using row 2 as headers, data from row 3 down.
+    vals = ws.get_all_values()
+    if len(vals) < HEADER_ROW:
+        return [], []
+    headers = [h.strip() for h in vals[HEADER_ROW - 1]]
+    rows = []
+    for i, raw in enumerate(vals[HEADER_ROW:]):
+        rec = {}
+        for j, h in enumerate(headers):
+            rec[h] = raw[j] if j < len(raw) else ""
+        rec["_row"] = HEADER_ROW + 1 + i  # physical row number for update_cell
+        rows.append(rec)
+    return headers, rows
+
+
+def append_rows(ws, headers, dict_rows):
+    if not dict_rows:
+        return
+    matrix = []
+    for d in dict_rows:
+        matrix.append([_cell(d.get(h, "")) for h in headers])
+    ws.append_rows(matrix, value_input_option="RAW",
+                   table_range="A%d" % HEADER_ROW)
+
+
+def set_cell(ws, headers, row_number, column_name, value):
+    if column_name not in headers:
+        raise RuntimeError("column not found: " + column_name)
+    col = headers.index(column_name) + 1
+    ws.update_cell(row_number, col, _cell(value))
+
+
+def _cell(v):
+    if v is True:
+        return "TRUE"
+    if v is False:
+        return "FALSE"
+    if v is None:
+        return ""
+    return v if isinstance(v, str) else str(v)
+
+
+# ---------------------------------------------------------------------------
+# Google Drive (download / list) via the service account bearer token
+# ---------------------------------------------------------------------------
+def _sa_bearer():
+    from google.oauth2.service_account import Credentials
+    from google.auth.transport.requests import Request
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_file(GOOGLE_SA, scopes=scopes)
+    creds.refresh(Request())
+    return creds.token
+
+
+def drive_list(folder_id=DRIVE_WZ_INBOX_FOLDER_ID):
+    # List non-trashed files in a Shared Drive folder.
+    token = _sa_bearer()
+    q = urllib.parse.quote("'%s' in parents and trashed = false" % folder_id)
+    url = ("https://www.googleapis.com/drive/v3/files?q=%s"
+           "&fields=files(id,name,mimeType,createdTime)"
+           "&supportsAllDrives=true&includeItemsFromAllDrives=true"
+           "&corpora=allDrives&pageSize=1000" % q)
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data.get("files", [])
+
+
+def drive_download(file_id, dest_path):
+    token = _sa_bearer()
+    url = ("https://www.googleapis.com/drive/v3/files/%s?alt=media"
+           "&supportsAllDrives=true" % file_id)
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        blob = resp.read()
+    with open(dest_path, "wb") as f:
+        f.write(blob)
+    return dest_path
+
+
+# ---------------------------------------------------------------------------
+# LLM via `openclaw infer` (never call OpenAI/DeepSeek directly)
+# ---------------------------------------------------------------------------
+def _run(cmd):
+    log("run: " + " ".join(cmd[:6]) + (" ..." if len(cmd) > 6 else ""))
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+def _extract_model_json(stdout):
+    # stdout is JSON from openclaw: outputs[0]["text"] holds the model text,
+    # from which we pull the first {...} block (robust parse, like m3).
+    try:
+        env = json.loads(stdout)
+        txt = env["outputs"][0]["text"]
+    except Exception:
+        txt = stdout
+    m = re.search(r"\{.*\}", txt, re.S)
+    if not m:
+        raise RuntimeError("no JSON object in model output")
+    return json.loads(m.group(0))
+
+
+def infer_text(prompt):
+    cmd = ["openclaw", "infer", "model", "run", "--prompt", prompt,
+           "--model", LLM_TEXT, "--json"]
+    rc, out, err = _run(cmd)
+    if rc != 0:
+        log("text LLM primary failed (%s), fallback. stderr: %s" % (LLM_TEXT, err[:300]))
+        cmd = ["openclaw", "infer", "model", "run", "--prompt", prompt,
+               "--model", LLM_TEXT_FALLBACK, "--json"]
+        rc, out, err = _run(cmd)
+        if rc != 0:
+            raise RuntimeError("text LLM failed: " + err[:300])
+    return _extract_model_json(out)
+
+
+def infer_vision(prompt, file_path):
+    cmd = ["openclaw", "infer", "model", "run", "--model", LLM_VISION,
+           "--file", file_path, "--prompt", prompt, "--json"]
+    rc, out, err = _run(cmd)
+    if rc != 0:
+        raise RuntimeError("vision LLM failed: " + err[:300])
+    return _extract_model_json(out)
+
+
+# ---------------------------------------------------------------------------
+# Telegram (Admin sink) via `openclaw message send`
+# ---------------------------------------------------------------------------
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# Noise lines emitted by the openclaw CLI that must not leak into alerts.
+_NOISE_SUBSTR = ("legacy state migration", "state migration", "migrating state")
+
+
+def clean_msg(s):
+    # Strip ANSI colour codes and drop openclaw warning noise; keep the essence.
+    s = _ANSI_RE.sub("", s or "")
+    keep = []
+    for ln in s.splitlines():
+        low = ln.strip().lower()
+        if not low:
+            continue
+        if any(n in low for n in _NOISE_SUBSTR):
+            continue
+        keep.append(ln.strip())
+    return " ".join(keep).strip()[:400]
+
+
+def tg(message):
+    msg = clean_msg(message) or "(pusty komunikat)"
+    cmd = ["openclaw", "message", "send", "--channel", "telegram",
+           "--target", TG_TARGET, "--thread-id", TG_THREAD, "--message", msg]
+    rc, out, err = _run(cmd)
+    if rc != 0:
+        log("telegram send failed: " + err[:300])
+    return rc == 0
+
+
+# ---------------------------------------------------------------------------
+# NBP FX (public API, no key) - last working day BEFORE the document date.
+# ---------------------------------------------------------------------------
+def nbp_rate(currency, doc_date):
+    # doc_date "YYYY-MM-DD". Returns (rate_to_pln, rate_date) or (None, None).
+    cur = (currency or "").strip().upper()
+    if cur in ("", "PLN"):
+        return None, None
+    # NBP tables/{table}/{code}/last/{n} gives recent rates; we pick the last
+    # published rate on or before the day before doc_date.
+    url = "https://api.nbp.pl/api/exchangerates/rates/A/%s/last/10/?format=json" % cur
+    try:
+        req = urllib.request.Request(url)
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        rates = data.get("rates", [])
+    except Exception as e:
+        log("NBP fetch failed for %s: %s" % (cur, e))
+        return None, None
+    # choose the newest effectiveDate strictly before doc_date
+    best = None
+    for r in rates:
+        d = r.get("effectiveDate", "")
+        if d and d < doc_date:
+            if best is None or d > best.get("effectiveDate", ""):
+                best = r
+    if best is None and rates:
+        best = rates[-1]
+    if best is None:
+        return None, None
+    return best.get("mid"), best.get("effectiveDate")
+
+
+# ---------------------------------------------------------------------------
+# small utils
+# ---------------------------------------------------------------------------
+def to_float(v):
+    s = str(v or "").strip().replace(",", ".")
+    if s == "":
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def is_true(v):
+    return str(v or "").strip().lower() in ("true", "prawda", "1", "yes", "tak")
+
+
+def load_cursor(name):
+    path = os.path.join(SECRETS_DIR, name)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_cursor(name, obj, dry=False):
+    path = os.path.join(SECRETS_DIR, name)
+    if dry:
+        log("dry: would save cursor %s (%d keys)" % (name, len(obj)))
+        return
+    backup_file(path)
+    with open(path, "w") as f:
+        json.dump(obj, f)
