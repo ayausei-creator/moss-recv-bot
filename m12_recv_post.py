@@ -133,6 +133,7 @@ def build_items(doty, doc_id, lines, dry):
                 "vat_rate": ln.get("vat_rate", ""),
                 "date": ln.get("_doc_date", ""),
                 "faktura_ref": ln.get("_ksef_ref", ""),
+                "_name": ln.get("raw_name", ""),  # local only, for --dry report
             })
             continue
 
@@ -161,14 +162,21 @@ def build_items(doty, doc_id, lines, dry):
         price = rc.to_float(ln.get("purchase_price_pln"))
         # Postable by QUANTITY: need product + qty. Price is NOT required.
         if not product_id or qty is None:
-            reason = "brak productId" if not product_id else "brak ilosci"
-            notpostable.append((line_no, reason))
+            if not product_id:
+                reason = "brak productId (niedopasowane)"
+            elif rc.is_true(ln.get("unit_flag")):
+                reason = "brak ilosci (unit_flag / przelicz recznie)"
+            else:
+                reason = "brak ilosci"
+            notpostable.append((line_no, ln.get("raw_name", ""), reason))
             rc.log("  line %s not postable (%s) - skipping" % (line_no, reason))
             continue
         item = {
             "_productId": product_id,
             "quantity": qty,
             "_line_id": ln.get("line_id", ""),  # local only, stripped before send
+            "_name": ln.get("raw_name", ""),    # local only, for --dry report
+            "_unit": ln.get("canonical_unit", ""),
         }
         if price is not None and price > 0:
             item["purchasePrice"] = price
@@ -208,6 +216,60 @@ def stockup_body(items, invoice_number, supplier_id=None, note="", with_price=Tr
     if note:
         body["note"] = note
     return body
+
+
+def _qfmt(x):
+    try:
+        return ("%g" % float(x))
+    except Exception:
+        return str(x)
+
+
+def dry_report(doc_id, invoice_number, supplier_id, note,
+               priced, qtyonly, koszt_rows, tasks, skipped, notpostable):
+    # Human-readable, UNTRUNCATED preview + full JSON body written to a file,
+    # so the whole receipt can be reviewed before --live.
+    path = "/tmp/m12_dry_body_%s.json" % str(doc_id)[:8]
+    payload = {
+        "doc_id": doc_id,
+        "invoiceNumber": invoice_number,
+        "priced": stockup_body(priced, invoice_number, supplier_id, note, True) if priced else None,
+        "qtyonly": stockup_body(qtyonly, invoice_number, supplier_id, note, False) if qtyonly else None,
+    }
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        rc.log("dry: FULL stockup body written to %s" % path)
+    except Exception as e:
+        rc.log("dry: could not write body file: %s" % e)
+
+    def show_group(label, items, with_price):
+        rc.log("  == %s: %d poz. ==" % (label, len(items)))
+        for i, it in enumerate(items, 1):
+            price = (" | %s PLN" % it["purchasePrice"]) if (with_price and it.get("purchasePrice") is not None) else " | bez ceny"
+            rc.log("    %2d. %-40s | pid=%s | %s %s%s"
+                   % (i, (it.get("_name") or "")[:40], it.get("_productId", ""),
+                      _qfmt(it.get("quantity")), it.get("_unit") or "", price))
+
+    if priced:
+        show_group("PRICED (updatePurchasePrice=true)", priced, True)
+    if qtyonly:
+        show_group("QTY-ONLY (updatePurchasePrice=false, cena bez zmian)", qtyonly, False)
+    if notpostable:
+        rc.log("  == NIE do stockup: %d ==" % len(notpostable))
+        for (lno, nm, reason) in notpostable:
+            rc.log("    - linia %s: %-40s -> %s" % (lno, (nm or "")[:40], reason))
+    if koszt_rows:
+        rc.log("  == KOSZT (expense_direct, nie na magazyn): %d ==" % len(koszt_rows))
+        for k in koszt_rows:
+            rc.log("    - %-40s | %s | %s PLN"
+                   % ((k.get("_name") or "")[:40], k.get("category", ""), k.get("net_pln", "")))
+    if tasks:
+        rc.log("  == ZADANIA (do receptury): %d ==" % len(tasks))
+        for t in tasks:
+            rc.log("    - %s" % t.get("note", ""))
+    if skipped:
+        rc.log("  == pominietych (skip): %d ==" % skipped)
 
 
 # ---------------------------------------------------------------------------
@@ -264,14 +326,8 @@ def main():
         rc.log("doc %s: priced=%d, qtyonly=%d, koszt=%d, task=%d, skip=%d, notpostable=%d"
                % (doc_id, len(priced), len(qtyonly), len(koszt_rows), len(tasks),
                   skipped, len(notpostable)))
-        for (lno, reason) in notpostable:
-            rc.log("  doc %s line %s NOT postable: %s" % (doc_id, lno, reason))
-        if priced:
-            rc.log("doc %s: PRICED body = %s" % (doc_id, json.dumps(
-                stockup_body(priced[:100], invoice_number, d.get("supplier_id"), note, True))[:800]))
-        if qtyonly:
-            rc.log("doc %s: QTY-ONLY body (updatePurchasePrice=false) = %s" % (doc_id, json.dumps(
-                stockup_body(qtyonly[:100], invoice_number, d.get("supplier_id"), note, False))[:800]))
+        dry_report(doc_id, invoice_number, d.get("supplier_id"), note,
+                   priced, qtyonly, koszt_rows, tasks, skipped, notpostable)
 
         if dry:
             rc.log("dry: NOT posting doc %s" % doc_id)
