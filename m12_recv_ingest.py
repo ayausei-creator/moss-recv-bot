@@ -320,36 +320,96 @@ def _fmt(x):
     return ("%g" % x) if x is not None else ""
 
 
-def compute_qty(line, dict_packf, catalog_unit):
-    # Turn the parsed packaging into a warehouse-unit quantity, and refuse to
-    # auto-fill when the reading is not trustworthy (protects against x1000).
+# Unit normalization: map a unit string to (dimension, factor-to-base).
+# base of mass = kg, base of volume = l, base of count = szt.
+_UNIT_MAP = {
+    # mass
+    "kg": ("mass", 1.0), "kilogram": ("mass", 1.0), "kilogramy": ("mass", 1.0),
+    "dag": ("mass", 0.01), "dekagram": ("mass", 0.01),
+    "g": ("mass", 0.001), "gram": ("mass", 0.001), "gramy": ("mass", 0.001), "gr": ("mass", 0.001),
+    "mg": ("mass", 0.000001),
+    # volume
+    "l": ("vol", 1.0), "litr": ("vol", 1.0), "litry": ("vol", 1.0), "liter": ("vol", 1.0),
+    "dl": ("vol", 0.1), "cl": ("vol", 0.01),
+    "ml": ("vol", 0.001), "mililitr": ("vol", 0.001),
+    # count
+    "szt": ("count", 1.0), "szt.": ("count", 1.0), "sztuka": ("count", 1.0),
+    "sztuki": ("count", 1.0), "pcs": ("count", 1.0), "pc": ("count", 1.0),
+    "opak": ("count", 1.0), "opakowanie": ("count", 1.0), "op": ("count", 1.0),
+}
+
+
+def normalize_unit(u):
+    key = (u or "").strip().lower().rstrip(".")
+    if key in _UNIT_MAP:
+        return _UNIT_MAP[key]
+    # also try without trailing '.' variant present in map
+    if (key + ".") in _UNIT_MAP:
+        return _UNIT_MAP[key + "."]
+    return (None, None)
+
+
+def compute_qty(line, dict_packf, target_unit):
+    # Quantity in the MATCHED INGREDIENT's unit (target_unit from Recv_Catalog).
+    # Converts across the same dimension (g<->kg, ml<->l). If the source cannot
+    # be converted to the ingredient unit (e.g. pieces to kg with no weight),
+    # we DO NOT guess: unit_flag + empty qty ("przelicz recznie").
     # Returns (canonical_qty, canonical_unit, qty_breakdown, unit_flag).
     count = rc.to_float(line.get("pack_count"))
     size = rc.to_float(line.get("pack_size"))
     raw_qty = rc.to_float(line.get("raw_qty"))
-    unit = (line.get("pack_unit") or "").strip() or (catalog_unit or "") or \
-        (line.get("raw_unit") or "")
+    punit = (line.get("pack_unit") or "").strip()
+    runit = (line.get("raw_unit") or "").strip()
+    tdim, tfac = normalize_unit(target_unit)
+    tunit = (target_unit or "").strip()
 
-    # 1) clean decomposition from the document: count x size
+    def to_target(amount, unit):
+        # amount in `unit` -> value in target unit, or (None,None) if it cannot
+        # be converted to the ingredient's dimension.
+        if amount is None:
+            return None, None
+        sdim, sfac = normalize_unit(unit)
+        if tdim is None:
+            # unknown ingredient unit -> keep source unit as-is (best effort)
+            return amount, (unit or tunit or "")
+        if sdim == tdim and sfac is not None:
+            return amount * sfac / tfac, tunit
+        return None, None  # dimension mismatch
+
+    def flag_manual():
+        hint = " (jednostka skladnika: %s)" % tunit if tunit else ""
+        return "", (tunit or punit or runit or ""), "przelicz recznie" + hint, True
+
+    # 1) clean pack decomposition: count x size in pack_unit (or raw unit)
     if count and size and count > 0 and size > 0:
-        canon = count * size
-        bd = "%s x %s %s = %s %s" % (_fmt(count), _fmt(size), unit, _fmt(canon), unit)
-        return _fmt(canon), unit, bd, bool(canon >= 100000)
+        src_unit = punit or runit
+        val, u = to_target(count * size, src_unit)
+        if val is None:
+            return flag_manual()
+        bd = "%s x %s %s = %s %s" % (_fmt(count), _fmt(size), src_unit or "", _fmt(val), u)
+        return _fmt(val), u, bd, bool(val >= 100000)
 
-    # 2) learned pack factor from the dictionary
+    # 2) learned pack factor from the dictionary (assumed already in target unit)
     if dict_packf and dict_packf != 1.0 and raw_qty is not None:
         canon = raw_qty * dict_packf
-        bd = "%s x %s = %s %s" % (_fmt(raw_qty), _fmt(dict_packf), _fmt(canon), unit)
-        return _fmt(canon), unit, bd, bool(canon >= 100000 or dict_packf >= 1000)
+        bd = "%s x %s = %s %s" % (_fmt(raw_qty), _fmt(dict_packf), _fmt(canon), tunit)
+        return _fmt(canon), (tunit or runit or ""), bd, bool(canon >= 100000 or dict_packf >= 1000)
 
-    # 3) plain quantity, trusted ONLY if the name has no packaging hint
+    # 3) plain quantity in the raw unit -> convert to ingredient unit
     name = line.get("raw_name", "")
     hint = re.search(r"(/\s*\d+|\d+\s*[x/]\s*\d+|\bx\s*\d+)", name, re.I)
     if raw_qty is not None and not hint:
-        return _fmt(raw_qty), unit, "", bool(raw_qty >= 100000)
+        val, u = to_target(raw_qty, runit)
+        if val is not None:
+            bd = "" if (u == runit or not runit) else "%s %s = %s %s" % (_fmt(raw_qty), runit, _fmt(val), u)
+            return _fmt(val), u, bd, bool(val >= 100000)
+        if tdim is not None:
+            # raw unit incompatible with ingredient unit (e.g. szt vs kg) -> flag
+            return flag_manual()
+        return _fmt(raw_qty), (runit or ""), "", bool(raw_qty >= 100000)
 
-    # 4) not trustworthy -> flag, NO auto value (manager enters manually)
-    return "", unit, "sprawdz ilosc/opakowanie recznie", True
+    # 4) not trustworthy -> flag, NO auto value
+    return flag_manual()
 
 
 def normalize_line(line, packf, canonical_unit):

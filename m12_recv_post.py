@@ -86,11 +86,19 @@ def create_product(doty, name, category_id, unit, vat, sale_price, ean, dry):
     if ean:
         body["ean"] = ean
     if dry:
-        rc.log("dry: would POST /products %s" % json.dumps(body))
+        rc.log("dry: would POST /products [%s]" % json.dumps(body))
         return "DRY_NEW_%d" % (abs(hash(name)) % 100000)
-    status, data, _ = doty.post("/products", body)
-    pid = str((data or {}).get("id") or (data or {}).get("_id") or "")
-    rc.log("created product %s -> id %s" % (name, pid))
+    # Dotypos v2 POST /products expects an ARRAY of product objects (bulk),
+    # and returns an array. Wrap the single object and read data[0].
+    status, data, _ = doty.post("/products", [body])
+    obj = {}
+    if isinstance(data, list) and data:
+        obj = data[0]
+    elif isinstance(data, dict):
+        inner = data.get("data")
+        obj = inner[0] if isinstance(inner, list) and inner else data
+    pid = str(obj.get("id") or obj.get("_id") or "")
+    rc.log("created product %s -> id %s (HTTP %s)" % (name, pid, status))
     return pid
 
 
