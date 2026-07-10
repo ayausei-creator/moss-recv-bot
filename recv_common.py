@@ -214,13 +214,40 @@ def gc():
     return _GC
 
 
+# Per-process caches to cut Sheets READ quota. gspread's sh.worksheet(title)
+# fetches the ENTIRE spreadsheet metadata on EVERY call, so a run that opens 5
+# tabs used to spend 5 metadata reads; we fetch the worksheet list ONCE and reuse
+# it. Each cron invocation is a fresh process, so there is no stale-cache risk
+# across runs. open_by_key itself is lazy (no API call until data is read).
+_SH = None
+_WS_CACHE = {}  # sheet_id -> {title: Worksheet}
+
+
+def _spreadsheet(sheet_id=RECV_SHEET_ID):
+    global _SH
+    if _SH is None or _SH.id != sheet_id:
+        _SH = gc().open_by_key(sheet_id)  # lazy: no metadata fetch here
+    return _SH
+
+
+def _worksheets_map(sh):
+    m = _WS_CACHE.get(sh.id)
+    if m is None:
+        m = dict((ws.title, ws) for ws in sh.worksheets())  # ONE metadata read
+        _WS_CACHE[sh.id] = m
+    return m
+
+
 def open_ws(tab, headers=None, sheet_id=RECV_SHEET_ID):
-    # Open a worksheet, creating it with a HEADER_ROW=2 layout if missing.
-    sh = gc().open_by_key(sheet_id)
-    try:
-        ws = sh.worksheet(tab)
-    except Exception:
+    # Open a worksheet, creating it with a HEADER_ROW=2 layout if missing. Reuses
+    # a per-process worksheet map so repeated opens in one run do not re-fetch the
+    # spreadsheet metadata.
+    sh = _spreadsheet(sheet_id)
+    wsmap = _worksheets_map(sh)
+    ws = wsmap.get(tab)
+    if ws is None:
         ws = sh.add_worksheet(title=tab, rows=1000, cols=max(10, len(headers or []) + 2))
+        wsmap[tab] = ws
     if headers:
         cur = ws.row_values(HEADER_ROW)
         if [h.strip() for h in cur[:len(headers)]] != headers:
@@ -228,6 +255,31 @@ def open_ws(tab, headers=None, sheet_id=RECV_SHEET_ID):
             end = _col_letter(len(headers))
             ws.update("A%d:%s%d" % (HEADER_ROW, end, HEADER_ROW), [headers])
     return ws
+
+
+def control_row():
+    # ONE Sheets read: fetch JUST the Recv_Control range. No metadata fetch, no
+    # header validation, no other tabs -- this keeps the every-minute
+    # --if-requested trigger at a single read request. Returns
+    # (row_dict, physical_row_number) for the key="control" row, or (None, None)
+    # if the tab is absent/empty/unreadable (the trigger then simply no-ops).
+    try:
+        sh = _spreadsheet(RECV_SHEET_ID)
+        resp = sh.values_get("%s!A%d:F" % (TAB_CONTROL, HEADER_ROW))
+    except Exception as e:
+        log("control read skipped: %s" % e)
+        return None, None
+    values = resp.get("values", []) or []
+    if len(values) < 2:
+        return None, None
+    headers = [h.strip() for h in values[0]]
+    for i, raw in enumerate(values[1:]):
+        rec = {}
+        for j, h in enumerate(headers):
+            rec[h] = raw[j] if j < len(raw) else ""
+        if (rec.get("key") or "").strip() == "control":
+            return rec, HEADER_ROW + 1 + i  # physical row for set_cell
+    return None, None
 
 
 def _col_letter(n):

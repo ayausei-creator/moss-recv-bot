@@ -431,25 +431,27 @@ def normalize_line(line, packf, canonical_unit):
 # ---------------------------------------------------------------------------
 # --if-requested trigger: claim a fresh scan request from Recv_Control
 # ---------------------------------------------------------------------------
-def claim_scan_request(dry=False):
-    # Read the single Recv_Control row (key="control"). Return the request token
-    # to run on, or None when there is nothing fresh to do. On a live run we
-    # CLAIM the request first (scan_done = scan_request) BEFORE any heavy work,
-    # so the next 1-minute tick will not re-run the same request. This is the
-    # only Sheets touch on the idle path, keeping the every-minute cron cheap.
+def _stamp_control(row_num, patch):
+    # Write path (rare): runs only when there is a fresh/stale request to stamp.
+    # Kept out of the idle path so the every-minute tick stays read-only.
     ws = rc.open_ws(rc.TAB_CONTROL, rc.CONTROL_HEADERS)
-    headers, rows = rc.read_records(ws)
-    row = None
-    for r in rows:
-        if (r.get("key") or "").strip() == "control":
-            row = r
-            break
+    for k, v in patch.items():
+        rc.set_cell(ws, rc.CONTROL_HEADERS, row_num, k, v)
+
+
+def claim_scan_request(dry=False):
+    # Read ONLY the single Recv_Control row via one cheap values.get (no heavy
+    # tabs, no metadata). Return the request token to run on, or None when there
+    # is nothing fresh to do. On a live claim we stamp scan_done FIRST so the
+    # next 1-minute tick will not re-run the same request. The idle path (the
+    # common every-minute case) is exactly ONE Sheets read and nothing else.
+    row, row_num = rc.control_row()
     if not row:
         return None
     req = str(row.get("scan_request") or "").strip()
     done = str(row.get("scan_done") or "").strip()
     if not req or req == done:
-        return None  # nothing new since we last ran
+        return None  # nothing new since we last ran -> one read, done
     try:
         req_ms = int(float(req))
     except (TypeError, ValueError):
@@ -461,16 +463,16 @@ def claim_scan_request(dry=False):
         rc.log("if-requested: request %s is stale (%ds old), ignored"
                % (req, (now_ms - req_ms) // 1000))
         if not dry:
-            rc.set_cell(ws, headers, row["_row"], "scan_done", req)
-            rc.set_cell(ws, headers, row["_row"], "note", "stale request ignored")
-            rc.set_cell(ws, headers, row["_row"], "updated_at", now_ts())
+            _stamp_control(row_num, {"scan_done": req,
+                                     "note": "stale request ignored",
+                                     "updated_at": now_ts()})
         return None
     if dry:
         rc.log("if-requested (dry): would claim scan request %s" % req)
         return req
-    rc.set_cell(ws, headers, row["_row"], "scan_done", req)
-    rc.set_cell(ws, headers, row["_row"], "note", "scan started " + now_ts())
-    rc.set_cell(ws, headers, row["_row"], "updated_at", now_ts())
+    _stamp_control(row_num, {"scan_done": req,
+                             "note": "scan started " + now_ts(),
+                             "updated_at": now_ts()})
     return req
 
 
