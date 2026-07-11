@@ -70,6 +70,39 @@ def probe(doty):
 
 
 # ---------------------------------------------------------------------------
+# id extraction from a Dotypos POST response (robust to shape)
+# ---------------------------------------------------------------------------
+def _extract_id(data, hdrs=None):
+    # Pull a created-resource id from a Dotypos v2 POST response whatever the
+    # shape: a bare object {id/_id}, an ARRAY (bulk endpoints return arrays), or
+    # a {"data":[...]} envelope. Falls back to the Location header's trailing id.
+    # Returns "" when nothing usable is present (caller logs the raw body).
+    obj = None
+    if isinstance(data, list):
+        obj = data[0] if data else None
+    elif isinstance(data, dict):
+        inner = data.get("data")
+        if isinstance(inner, list) and inner:
+            obj = inner[0]
+        elif isinstance(inner, dict):
+            obj = inner
+        else:
+            obj = data
+    if isinstance(obj, dict):
+        for k in ("id", "_id", "stockupId", "_stockupId"):
+            v = obj.get(k)
+            if v not in (None, ""):
+                return str(v)
+    if hdrs:
+        loc = hdrs.get("Location") or hdrs.get("location") or ""
+        if loc:
+            tail = loc.rstrip("/").rsplit("/", 1)[-1]
+            if tail:
+                return str(tail)
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # product creation (schema VERIFY before live). Returns new productId or None.
 # ---------------------------------------------------------------------------
 def create_product(doty, name, category_id, unit, vat, sale_price, ean, dry):
@@ -345,7 +378,12 @@ def main():
                     cbody = stockup_body(chunk, invoice_number, d.get("supplier_id"),
                                          note, with_price)
                     status, data, hdrs = doty.post(STOCKUPS_PATH, cbody)
-                    sid = str((data or {}).get("id") or (data or {}).get("_id") or "")
+                    sid = _extract_id(data, hdrs)
+                    if not sid:
+                        # Never lose the stock-up id silently: log what came back
+                        # so the response shape is visible for the next run.
+                        rc.log("doc %s: stock-up id NOT found in response (HTTP %s) raw=%s"
+                               % (doc_id, status, json.dumps(data)[:300]))
                     sids.append(sid)
                     rc.log("doc %s: stock-up %s chunk (%d it.) id=%s HTTP %s"
                            % (doc_id, "priced" if with_price else "qtyonly",
