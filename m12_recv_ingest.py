@@ -73,23 +73,33 @@ def page_ids_of(d):
     return ids
 
 
+def _num_key(v):
+    return str(v or "").strip().replace(",", ".")
+
+
 def dedup_parsed_lines(lines):
     # Drop positions repeated inside ONE parse (brief item 1). The LLM sometimes
-    # emits the same physical line twice (Maracana WZ came back doubled). Key on
-    # the printed identity: name + qty + unit + supplier code / EAN. First wins,
-    # order preserved. Returns (unique_lines, removed_count).
+    # emits the same physical line twice (Maracana WZ came back doubled). The key
+    # is the WHOLE printed identity - name + qty + unit + code/EAN + unit price +
+    # line total - so only a byte-for-byte repeat is collapsed. A wholesale doc
+    # that legitimately lists the same product twice with a different price/lot is
+    # kept (dropping it would silently under-receive stock). First wins, order
+    # preserved. Returns (unique_lines, removed_count).
     seen = set()
     out = []
     removed = 0
     for ln in lines:
+        name = norm_name(ln.get("raw_name"))
         key = "|".join([
-            norm_name(ln.get("raw_name")),
-            str(ln.get("raw_qty") or "").strip().replace(",", "."),
+            name,
+            _num_key(ln.get("raw_qty")),
             (ln.get("raw_unit") or "").strip().lower(),
             (ln.get("raw_supplier_code") or "").strip().lower(),
+            _num_key(ln.get("raw_unit_price")),
+            _num_key(ln.get("raw_line_total")),
         ])
         # A wholly empty key (no name at all) is not a meaningful dup signal.
-        if norm_name(ln.get("raw_name")) and key in seen:
+        if name and key in seen:
             removed += 1
             continue
         seen.add(key)
@@ -111,6 +121,41 @@ def delivery_key(supplier_ref, number, date, count, total):
     else:
         basis = "cnt|%s|%s|%s" % (supplier_ref, count, total)
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def delivery_key_for(supplier_ref, number, date, count, total):
+    # Return a delivery dedup key ONLY when the document carries enough identity
+    # to trust a collision. A readable number is enough on its own; otherwise we
+    # need a supplier AND at least one line. A blank/unreadable scan (no number,
+    # no supplier, 0 lines) gets None -> it can never be flagged as a duplicate
+    # of another blank scan.
+    number_n = re.sub(r"\s+", " ", (number or "").strip())
+    if number_n:
+        return delivery_key(supplier_ref, number, date, count, total)
+    if (supplier_ref or "").strip() and count and count > 0:
+        return delivery_key(supplier_ref, number, date, count, total)
+    return None
+
+
+def _sniff_source(path, fallback):
+    # Detect a page's real type from its magic bytes so a multi-page document
+    # mixing a PDF and a photo still parses each page correctly. Falls back to
+    # the document-level source when the signature is unrecognised.
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except Exception:
+        return fallback
+    if head[:4] == b"%PDF":
+        return "pdf"
+    if head[:5].lower() == b"<?xml":
+        return "ksef_xml"
+    if (head[:3] == b"\xff\xd8\xff"                       # JPEG
+            or head[:8] == b"\x89PNG\r\n\x1a\n"           # PNG
+            or head[:4] == b"RIFF"                        # WEBP container
+            or head[4:12] in (b"ftypheic", b"ftypmif1", b"ftypheix")):  # HEIC
+        return "image"
+    return fallback
 
 
 def _safe_part(s, maxlen=40):
@@ -625,14 +670,16 @@ def main():
         sid = (d.get("supplier_id") or "").strip()
         return sid or norm_name(d.get("supplier_name_raw"))
 
-    # Delivery keys already present (item 3) -> flag a colliding new doc.
+    # Delivery keys already present (item 3) -> flag a colliding new doc. Only
+    # docs with enough identity (number, or supplier+lines) get a key.
     known_delivery = {}
     for d in doc_rows:
         did = (d.get("doc_id") or "").strip()
         agg = line_agg.get(did, [0, 0.0])
-        k = delivery_key(_supplier_ref(d), d.get("doc_number"),
-                         d.get("doc_date"), agg[0], round(agg[1], 2))
-        known_delivery[k] = did
+        k = delivery_key_for(_supplier_ref(d), d.get("doc_number"),
+                             d.get("doc_date"), agg[0], round(agg[1], 2))
+        if k:
+            known_delivery[k] = did
 
     # --- step 1: scan Drive for new files -> candidate docs ----------------
     # The scan always runs so that --redo/--doc can also target a file that is
@@ -815,8 +862,11 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
                 return
             file_meta.append({"sha256": sha, "md5": md5, "fid": fid,
                               "filename": d.get("_name") or ""})
+            # For a single-file doc keep the known source; for a multi-page doc
+            # sniff each page so mixed PDF/photo pages parse correctly.
+            psource = _sniff_source(tmp, source) if multipage else source
             try:
-                page_parsed = parse_document(source, tmp, parse_prompt)
+                page_parsed = parse_document(psource, tmp, parse_prompt)
             finally:
                 try:
                     os.remove(tmp)
@@ -882,15 +932,17 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         lt = rc.to_float(ln.get("raw_line_total"))
         if lt is not None:
             net_total += lt
-    dedup_key = delivery_key(supplier_ref, parsed.get("doc_number", ""),
-                             doc_date, len(lines), round(net_total, 2))
-    prev_doc = ctx["known_delivery"].get(dedup_key)
-    is_dup = bool(prev_doc and prev_doc != doc_id)
+    dedup_key = delivery_key_for(supplier_ref, parsed.get("doc_number", ""),
+                                 doc_date, len(lines), round(net_total, 2)) or ""
+    is_dup = False
+    if dedup_key:
+        prev_doc = ctx["known_delivery"].get(dedup_key)
+        is_dup = bool(prev_doc and prev_doc != doc_id)
+        ctx["known_delivery"][dedup_key] = doc_id
+        if is_dup:
+            rc.log("doc %s: possible duplicate delivery of %s (key %s)"
+                   % (doc_id, prev_doc, dedup_key))
     status = "duplicate" if is_dup else "needs_review"
-    ctx["known_delivery"][dedup_key] = doc_id
-    if is_dup:
-        rc.log("doc %s: possible duplicate delivery of %s (key %s)"
-               % (doc_id, prev_doc, dedup_key))
 
     # fx
     fx_rate, fx_date = (None, None)
@@ -992,8 +1044,10 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         return
 
     # Double-append guard (item 1): never write a second copy of the lines for a
-    # doc that already has them (crash between line-write and status-update, or an
-    # overlapping run). --force reprocesses on purpose, so it is exempt.
+    # doc that already had them at the start of THIS run (e.g. a crash between
+    # line-write and status-update left status=parsing). It does NOT protect two
+    # ingests running concurrently - the --if-requested scan_done claim serializes
+    # the trigger cron for that. --force reprocesses on purpose, so it is exempt.
     if not ctx["force"] and doc_id in ctx["existing_line_doc_ids"]:
         rc.log("doc %s: already has lines -> skip re-append (no doubling)" % doc_id)
     else:

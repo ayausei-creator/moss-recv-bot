@@ -350,13 +350,26 @@ def _cell(v):
 # ---------------------------------------------------------------------------
 # Google Drive (download / list) via the service account bearer token
 # ---------------------------------------------------------------------------
+_SA_TOKEN = None
+_SA_TOKEN_TS = 0
+
+
 def _sa_bearer():
+    # Cache the service-account access token for the process (tokens live ~1h).
+    # We now make several Drive calls per parsed page (download + get_meta +
+    # move); minting a fresh token for each was wasteful. 45-min TTL is safely
+    # under the token lifetime.
+    global _SA_TOKEN, _SA_TOKEN_TS
+    if _SA_TOKEN and (time.time() - _SA_TOKEN_TS) < 2700:
+        return _SA_TOKEN
     from google.oauth2.service_account import Credentials
     from google.auth.transport.requests import Request
     scopes = ["https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_file(GOOGLE_SA, scopes=scopes)
     creds.refresh(Request())
-    return creds.token
+    _SA_TOKEN = creds.token
+    _SA_TOKEN_TS = time.time()
+    return _SA_TOKEN
 
 
 def drive_list(folder_id=DRIVE_WZ_INBOX_FOLDER_ID):
