@@ -61,6 +61,9 @@ Rules:
   gross value and leave vat_rate so the human can adjust.
 - One object per physical line item. Do not merge or split lines. Skip
   summary/total rows.
+- NEVER repeat a line. Each physical position on the document appears EXACTLY
+  ONCE in "lines". Do not output the same item twice, and do not restart the
+  list from the top. If the document has 11 positions, return exactly 11 objects.
 - Do not invent products, codes, or prices. Empty string when unsure.
 - Keep the item name in the original language of the document.
 - Return ONLY the JSON object described above.

@@ -9,6 +9,7 @@
 # This module writes NOTHING to Dotypos by itself. The only live write lives in
 # m12_recv_post.py and is gated behind an explicit --live flag (see sec.0 of brief).
 
+import hashlib
 import json
 import os
 import re
@@ -61,6 +62,19 @@ TAB_CATALOG = "Recv_Catalog"
 TAB_KOSZT = "Recv_Koszt"
 TAB_TASKS = "Recv_Tasks"
 TAB_CONTROL = "Recv_Control"
+TAB_FILES = "Recv_Files"
+
+# Recv_Files - registry of processed source files (exact-duplicate guard, audit).
+# One row per physical file the bot has parsed. sha256/md5 are content hashes of
+# the downloaded bytes; a byte-identical re-upload matches and is skipped
+# silently (brief item 2). Never used to reject a mere re-scan of the same
+# drive_file_id (that is handled by known_file_ids), only true content dups.
+FILES_HEADERS = ["sha256", "md5", "doc_id", "drive_file_id",
+                 "filename", "doc_number", "supplier", "ts"]
+
+# Subfolder of the WZ inbox where successfully parsed files are moved so the
+# inbox always shows only what still needs work (brief item 4).
+DRIVE_PROCESSED_SUBFOLDER = "Przetworzone"
 
 # Recv_Control - single-row control channel between the manager app and this bot.
 # The app writes scan_request (epoch ms) when the manager taps "Rozpoznaj"; the
@@ -346,11 +360,16 @@ def _sa_bearer():
 
 
 def drive_list(folder_id=DRIVE_WZ_INBOX_FOLDER_ID):
-    # List non-trashed files in a Shared Drive folder.
+    # List non-trashed files in a Shared Drive folder. md5Checksum lets us skip a
+    # byte-identical re-upload WITHOUT downloading it (exact-dup guard, item 2).
+    # Folders are excluded so the "Przetworzone" subfolder is never mistaken for
+    # an inbox document.
     token = _sa_bearer()
-    q = urllib.parse.quote("'%s' in parents and trashed = false" % folder_id)
+    q = urllib.parse.quote(
+        "'%s' in parents and trashed = false "
+        "and mimeType != 'application/vnd.google-apps.folder'" % folder_id)
     url = ("https://www.googleapis.com/drive/v3/files?q=%s"
-           "&fields=files(id,name,mimeType,createdTime)"
+           "&fields=files(id,name,mimeType,createdTime,md5Checksum,size)"
            "&supportsAllDrives=true&includeItemsFromAllDrives=true"
            "&corpora=allDrives&pageSize=1000" % q)
     req = urllib.request.Request(url)
@@ -358,6 +377,75 @@ def drive_list(folder_id=DRIVE_WZ_INBOX_FOLDER_ID):
     with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return data.get("files", [])
+
+
+def _drive_request(method, url, body=None):
+    token = _sa_bearer()
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw.strip() else {}
+
+
+def drive_get_meta(file_id):
+    # Fetch name/mime/parents for a single file (used to keep the extension and
+    # find the current parent when moving a processed file).
+    url = ("https://www.googleapis.com/drive/v3/files/%s"
+           "?fields=id,name,mimeType,md5Checksum,parents&supportsAllDrives=true"
+           % file_id)
+    return _drive_request("GET", url)
+
+
+def drive_ensure_folder(name, parent_id):
+    # Return the id of subfolder `name` under parent_id, creating it if missing.
+    q = urllib.parse.quote(
+        "'%s' in parents and name = '%s' "
+        "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        % (parent_id, name.replace("'", "\\'")))
+    url = ("https://www.googleapis.com/drive/v3/files?q=%s"
+           "&fields=files(id,name)&supportsAllDrives=true"
+           "&includeItemsFromAllDrives=true&corpora=allDrives" % q)
+    found = _drive_request("GET", url).get("files", [])
+    if found:
+        return found[0].get("id", "")
+    body = {"name": name, "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id]}
+    created = _drive_request(
+        "POST",
+        "https://www.googleapis.com/drive/v3/files?supportsAllDrives=true&fields=id",
+        body)
+    return created.get("id", "")
+
+
+def drive_move_rename(file_id, new_name, add_parent, remove_parent):
+    # Move file into add_parent (out of remove_parent) and rename it. Files are
+    # only MOVED, never deleted (audit trail, brief item 4).
+    url = ("https://www.googleapis.com/drive/v3/files/%s"
+           "?addParents=%s&removeParents=%s&supportsAllDrives=true&fields=id,name"
+           % (file_id, urllib.parse.quote(add_parent),
+              urllib.parse.quote(remove_parent)))
+    return _drive_request("PATCH", url, {"name": new_name})
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def md5_file(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def drive_download(file_id, dest_path):

@@ -61,6 +61,70 @@ def norm_name(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def page_ids_of(d):
+    # Files that make up one document. A multi-page upload (brief item 5/6) sets
+    # page_file_ids = comma-separated Drive ids (first == primary drive_file_id).
+    # Single-file docs fall back to drive_file_id.
+    raw = (d.get("page_file_ids") or "").strip()
+    ids = [x.strip() for x in raw.split(",") if x.strip()] if raw else []
+    if not ids:
+        fid = (d.get("drive_file_id") or "").strip()
+        ids = [fid] if fid else []
+    return ids
+
+
+def dedup_parsed_lines(lines):
+    # Drop positions repeated inside ONE parse (brief item 1). The LLM sometimes
+    # emits the same physical line twice (Maracana WZ came back doubled). Key on
+    # the printed identity: name + qty + unit + supplier code / EAN. First wins,
+    # order preserved. Returns (unique_lines, removed_count).
+    seen = set()
+    out = []
+    removed = 0
+    for ln in lines:
+        key = "|".join([
+            norm_name(ln.get("raw_name")),
+            str(ln.get("raw_qty") or "").strip().replace(",", "."),
+            (ln.get("raw_unit") or "").strip().lower(),
+            (ln.get("raw_supplier_code") or "").strip().lower(),
+        ])
+        # A wholly empty key (no name at all) is not a meaningful dup signal.
+        if norm_name(ln.get("raw_name")) and key in seen:
+            removed += 1
+            continue
+        seen.add(key)
+        out.append(ln)
+    return out, removed
+
+
+def delivery_key(supplier_ref, number, date, count, total):
+    # Identity of a DELIVERY for cross-document dedup (brief item 3): supplier
+    # (NIP/supplier_id) + document number + date. When the number is unreadable,
+    # fall back to supplier + line count + net total. Deliberately does NOT hash
+    # the line contents, so a re-photo / file+KSeF pair of the same invoice
+    # collide and get flagged for the manager (never auto-dropped).
+    supplier_ref = (supplier_ref or "").strip().lower()
+    number = re.sub(r"\s+", " ", (number or "").strip().lower())
+    date = (date or "").strip()
+    if number:
+        basis = "num|%s|%s|%s" % (supplier_ref, number, date)
+    else:
+        basis = "cnt|%s|%s|%s" % (supplier_ref, count, total)
+    return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_part(s, maxlen=40):
+    # ASCII-safe, filesystem-safe fragment for a Drive filename.
+    s = (s or "").strip()
+    try:
+        import unicodedata
+        s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    except Exception:
+        pass
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
+    return s[:maxlen] or "dokument"
+
+
 # ---------------------------------------------------------------------------
 # parsing by source
 # ---------------------------------------------------------------------------
@@ -519,8 +583,10 @@ def main():
 
     docs_ws = rc.open_ws(rc.TAB_DOCS)
     lines_ws = rc.open_ws(rc.TAB_LINES)
+    files_ws = rc.open_ws(rc.TAB_FILES, rc.FILES_HEADERS)
     doc_headers, doc_rows = rc.read_records(docs_ws)
-    line_headers, _ = rc.read_records(lines_ws)
+    line_headers, line_rows = rc.read_records(lines_ws)
+    files_headers, file_rows = rc.read_records(files_ws)
     _, dict_rows = rc.read_records(rc.open_ws(rc.TAB_DICT))
     _, sup_rows = rc.read_records(rc.open_ws(rc.TAB_SUPPLIERS))
     _, cat_rows = rc.read_records(rc.open_ws(rc.TAB_CATALOG))
@@ -528,8 +594,45 @@ def main():
     dict_idx = build_dict_index(dict_rows)
     sup_by_nip = {re.sub(r"\D", "", (s.get("nip") or "")): s for s in sup_rows if s.get("nip")}
 
-    known_file_ids = set((d.get("drive_file_id") or "").strip() for d in doc_rows)
-    known_dedup = set((d.get("dedup_key") or "").strip() for d in doc_rows if d.get("dedup_key"))
+    # Per-doc line aggregates from the ONE Recv_Lines read (no extra reads):
+    # which docs already have lines (double-append guard, item 1) and their
+    # count + net total (delivery-dedup fallback when the number is unreadable).
+    existing_line_doc_ids = set()
+    line_agg = {}  # doc_id -> [count, total_net]
+    for lr in line_rows:
+        did = (lr.get("doc_id") or "").strip()
+        if not did:
+            continue
+        existing_line_doc_ids.add(did)
+        agg = line_agg.setdefault(did, [0, 0.0])
+        agg[0] += 1
+        lt = rc.to_float(lr.get("raw_line_total"))
+        if lt is not None:
+            agg[1] += lt
+
+    # Exact-file-dup registry (item 2): content hashes of already-parsed files.
+    known_md5 = {r.get("md5"): r for r in file_rows if (r.get("md5") or "").strip()}
+    known_sha = {r.get("sha256"): r for r in file_rows if (r.get("sha256") or "").strip()}
+
+    # Every file id already claimed by a doc - INCLUDING extra pages of a
+    # multi-page doc - so the scan never re-adds a page as its own document.
+    known_file_ids = set()
+    for d in doc_rows:
+        for pid in page_ids_of(d):
+            known_file_ids.add(pid)
+
+    def _supplier_ref(d):
+        sid = (d.get("supplier_id") or "").strip()
+        return sid or norm_name(d.get("supplier_name_raw"))
+
+    # Delivery keys already present (item 3) -> flag a colliding new doc.
+    known_delivery = {}
+    for d in doc_rows:
+        did = (d.get("doc_id") or "").strip()
+        agg = line_agg.get(did, [0, 0.0])
+        k = delivery_key(_supplier_ref(d), d.get("doc_number"),
+                         d.get("doc_date"), agg[0], round(agg[1], 2))
+        known_delivery[k] = did
 
     # --- step 1: scan Drive for new files -> candidate docs ----------------
     # The scan always runs so that --redo/--doc can also target a file that is
@@ -541,6 +644,8 @@ def main():
     except Exception as e:
         rc.log("drive_list failed: %s" % e)
         files = []
+    batch_md5 = {}  # md5 seen earlier in THIS scan -> first fid (same-run dup)
+    dup_skipped = 0
     for f in files:
         fid = f.get("id", "")
         if not fid or fid in known_file_ids:
@@ -555,6 +660,18 @@ def main():
         else:
             rc.log("skip unsupported file %s (%s)" % (f.get("name"), mime))
             continue
+        # Exact-duplicate file (item 2): a byte-identical file already parsed in
+        # an earlier run (known_md5) or earlier in this scan (batch_md5). Do NOT
+        # create a second document - move the copy out of the inbox, silently.
+        md5 = (f.get("md5Checksum") or "").strip()
+        if md5 and (md5 in known_md5 or md5 in batch_md5):
+            dup_skipped += 1
+            rc.log("scan: exact-dup file %s (md5 %s) -> skip, no new doc"
+                   % (f.get("name"), md5[:10]))
+            if not args.dry and not args.doc:
+                _move_processed(fid, "DUP_" + _safe_part(f.get("name") or fid, 60))
+            known_file_ids.add(fid)
+            continue
         rec = {
             "doc_id": str(uuid.uuid4()),
             "created_at": now_ts(),
@@ -567,9 +684,11 @@ def main():
             "currency": "PLN",
             "_name": f.get("name", ""),  # local only, for --redo matching
         }
+        if md5:
+            batch_md5[md5] = fid
         new_doc_rows.append(rec)
         known_file_ids.add(fid)
-    rc.log("scan: %d new file(s) in inbox" % len(new_doc_rows))
+    rc.log("scan: %d new file(s), %d exact-dup skipped" % (len(new_doc_rows), dup_skipped))
     if new_doc_rows and not args.dry and not args.doc:
         rc.append_rows(docs_ws, doc_headers, new_doc_rows)
         doc_headers, doc_rows = rc.read_records(docs_ws)
@@ -622,11 +741,20 @@ def main():
     todo = todo[:args.limit]
     rc.log("parse: %d document(s) to process" % len(todo))
 
+    ctx = {
+        "known_delivery": known_delivery,
+        "existing_line_doc_ids": existing_line_doc_ids,
+        "files_ws": files_ws,
+        "files_headers": files_headers,
+        "known_sha": known_sha,
+        "known_md5": known_md5,
+        "force": args.force,
+    }
     for d in todo:
         try:
             process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
                         docs_ws, doc_headers, lines_ws, line_headers,
-                        known_dedup, args.dry)
+                        ctx, args.dry)
         except Exception as e:
             rc.log("doc %s FAILED: %s" % (d.get("doc_id"), e))
             if not args.dry and d.get("_row"):
@@ -642,26 +770,74 @@ def main():
 
 def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
                 docs_ws, doc_headers, lines_ws, line_headers,
-                known_dedup, dry):
+                ctx, dry):
     doc_id = d.get("doc_id")
     source = (d.get("source") or "").strip()
     rc.log("--- doc %s source=%s ---" % (doc_id, source))
 
+    file_meta = []  # per parsed page: {"sha256","md5","fid","filename"}
     parsed = None
     if source in ("manual", "paragon"):
         rc.log("manual/paragon: lines already present, skip parse")
     else:
-        fid = (d.get("drive_file_id") or "").strip()
-        if not fid:
+        # A document can be ONE file or several pages (item 5). Parse each page
+        # and merge the positions into a single line list.
+        page_ids = page_ids_of(d)
+        if not page_ids:
             raise RuntimeError("no drive_file_id to parse")
         ext = {"pdf": ".pdf", "ksef_xml": ".xml"}.get(source, ".bin")
-        tmp = "/tmp/m12_recv_%s%s" % (doc_id, ext)
-        rc.drive_download(fid, tmp)
-        parsed = parse_document(source, tmp, parse_prompt)
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
+        merged = []
+        header = None
+        first_parsed = None
+        multipage = len(page_ids) > 1
+        for pno, fid in enumerate(page_ids, start=1):
+            tmp = "/tmp/m12_recv_%s_p%d%s" % (doc_id, pno, ext)
+            rc.drive_download(fid, tmp)
+            sha = rc.sha256_file(tmp)
+            md5 = rc.md5_file(tmp)
+            # Fallback exact-dup guard for a single bot file whose md5 was not in
+            # the Drive metadata at scan time (item 2): a byte-identical file
+            # already parsed under another doc -> drop this one silently.
+            prev = ctx["known_sha"].get(sha)
+            if (not multipage and prev
+                    and (prev.get("doc_id") or "") not in ("", doc_id)):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                rc.log("doc %s: exact-dup of %s (sha %s) -> drop, no lines"
+                       % (doc_id, prev.get("doc_id"), sha[:10]))
+                _set_doc(docs_ws, doc_headers, d,
+                         {"status": "duplicate", "updated_at": now_ts(),
+                          "notes": "dokladny duplikat pliku"}, dry)
+                if not dry:
+                    _move_processed(fid, "DUP_" + _safe_part(prev.get("filename") or fid, 60))
+                return
+            file_meta.append({"sha256": sha, "md5": md5, "fid": fid,
+                              "filename": d.get("_name") or ""})
+            try:
+                page_parsed = parse_document(source, tmp, parse_prompt)
+            finally:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+            if page_parsed is None:
+                continue
+            if first_parsed is None:
+                first_parsed = dict(page_parsed)
+            if header is None and any(page_parsed.get(k) for k in
+                                      ("supplier_name", "supplier_nip", "doc_number", "doc_date")):
+                header = dict(page_parsed)
+            pls = page_parsed.get("lines", []) or []
+            merged.extend(pls)
+            if multipage:
+                rc.log("doc %s: page %d/%d -> %d line(s)"
+                       % (doc_id, pno, len(page_ids), len(pls)))
+        # Header from the page that carries supplier/number/date; fall back to
+        # the first page (keeps currency etc. for an otherwise headerless page).
+        parsed = header or first_parsed or {}
+        parsed["lines"] = merged
 
     if parsed is None:
         # manual/paragon: just move to needs_review
@@ -669,6 +845,12 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         return
 
     lines = parsed.get("lines", []) or []
+    # Remove positions repeated within THIS parse (item 1) before anything else.
+    lines, dup_removed = dedup_parsed_lines(lines)
+    if dup_removed:
+        rc.log("doc %s: dropped %d duplicated position(s) inside the parse"
+               % (doc_id, dup_removed))
+    parsed["lines"] = lines
     # Never a silent zero: if the parser returned nothing usable, say why.
     parser_note = ""
     if not lines:
@@ -689,16 +871,26 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
     doc_date = (parsed.get("doc_date") or "").strip()
     is_foreign = bool(parsed.get("is_foreign")) or (sup and rc.is_true(sup.get("is_foreign_wnt")))
 
-    # dedup
-    basis = "%s|%s|%s|%s" % (
-        supplier_id or parsed.get("supplier_name", ""),
-        parsed.get("doc_number", ""),
-        doc_date,
-        hashlib.sha1(json.dumps(lines, sort_keys=True).encode("utf-8")).hexdigest()[:12],
-    )
-    dedup_key = hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
-    status = "duplicate" if dedup_key in known_dedup else "needs_review"
-    known_dedup.add(dedup_key)
+    # Delivery-level dedup (item 3): supplier(NIP)/id + number + date, fallback
+    # supplier + line count + net total when the number is unreadable. A hit is a
+    # POSSIBLE duplicate (re-photo, or file+KSeF of one invoice) -> flag for the
+    # manager, never auto-drop. Multi-page docs are ONE doc, so their merged
+    # pages cannot collide with each other.
+    supplier_ref = supplier_id or norm_name(parsed.get("supplier_name", ""))
+    net_total = 0.0
+    for ln in lines:
+        lt = rc.to_float(ln.get("raw_line_total"))
+        if lt is not None:
+            net_total += lt
+    dedup_key = delivery_key(supplier_ref, parsed.get("doc_number", ""),
+                             doc_date, len(lines), round(net_total, 2))
+    prev_doc = ctx["known_delivery"].get(dedup_key)
+    is_dup = bool(prev_doc and prev_doc != doc_id)
+    status = "duplicate" if is_dup else "needs_review"
+    ctx["known_delivery"][dedup_key] = doc_id
+    if is_dup:
+        rc.log("doc %s: possible duplicate delivery of %s (key %s)"
+               % (doc_id, prev_doc, dedup_key))
 
     # fx
     fx_rate, fx_date = (None, None)
@@ -799,8 +991,15 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         rc.log("dry: not writing doc %s (%d lines)" % (doc_id, len(line_records)))
         return
 
-    # write lines then update doc
-    rc.append_rows(lines_ws, line_headers, line_records)
+    # Double-append guard (item 1): never write a second copy of the lines for a
+    # doc that already has them (crash between line-write and status-update, or an
+    # overlapping run). --force reprocesses on purpose, so it is exempt.
+    if not ctx["force"] and doc_id in ctx["existing_line_doc_ids"]:
+        rc.log("doc %s: already has lines -> skip re-append (no doubling)" % doc_id)
+    else:
+        rc.append_rows(lines_ws, line_headers, line_records)
+        ctx["existing_line_doc_ids"].add(doc_id)
+
     patch = {
         "status": status,
         "updated_at": now_ts(),
@@ -818,6 +1017,15 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
     if parser_note:
         patch["notes"] = parser_note
     _set_doc(docs_ws, doc_headers, d, patch, dry)
+
+    # Record processed file(s) in Recv_Files and move them out of the inbox into
+    # Przetworzone/ with a readable name (items 2 + 4). Best-effort: a Drive
+    # hiccup here must not fail a doc whose lines are already written.
+    if file_meta:
+        try:
+            _register_and_move(ctx, d, parsed, doc_date, file_meta, net_total)
+        except Exception as e:
+            rc.log("doc %s: register/move failed: %s" % (doc_id, e))
 
 
 def _base_line(doc_id, line_no, ln, currency, fx_rate):
@@ -876,6 +1084,70 @@ def _set_doc(docs_ws, doc_headers, d, patch, dry):
     for k, v in patch.items():
         if k in doc_headers:
             rc.set_cell(docs_ws, doc_headers, d["_row"], k, v)
+
+
+_PROCESSED_FOLDER_ID = None
+
+
+def _processed_folder():
+    # Resolve (and cache for this process) the Przetworzone/ subfolder id.
+    global _PROCESSED_FOLDER_ID
+    if _PROCESSED_FOLDER_ID is None:
+        _PROCESSED_FOLDER_ID = rc.drive_ensure_folder(
+            rc.DRIVE_PROCESSED_SUBFOLDER, rc.DRIVE_WZ_INBOX_FOLDER_ID) or ""
+    return _PROCESSED_FOLDER_ID
+
+
+def _move_processed(fid, new_name):
+    # Move one file from the WZ inbox into the Przetworzone/ subfolder, renamed.
+    # Files are only MOVED (audit), never deleted. Best-effort + logged.
+    try:
+        processed = _processed_folder()
+        if not processed:
+            rc.log("move: no Przetworzone folder; leaving %s in inbox" % fid)
+            return
+        rc.drive_move_rename(fid, new_name, processed, rc.DRIVE_WZ_INBOX_FOLDER_ID)
+        rc.log("move: %s -> Przetworzone/%s" % (fid, new_name))
+    except Exception as e:
+        rc.log("move failed for %s: %s" % (fid, e))
+
+
+def _register_and_move(ctx, d, parsed, doc_date, file_meta, net_total):
+    # Append a Recv_Files row per page (audit + exact-dup registry) and move each
+    # page out of the inbox, renamed YYYY-MM-DD_Supplier_Suma.ext (+_strN pages).
+    doc_id = d.get("doc_id")
+    supplier = parsed.get("supplier_name", "") or d.get("supplier_name_raw", "")
+    number = parsed.get("doc_number", "") or d.get("doc_number", "")
+    date = (doc_date or rc.today_str()).strip()
+    suma = ("%.2f" % net_total) if net_total else ""
+    base = "_".join(p for p in [
+        date, _safe_part(supplier, 30), (suma + "PLN") if suma else ""] if p)
+    multi = len(file_meta) > 1
+
+    reg_rows = []
+    for m in file_meta:
+        row = {"sha256": m["sha256"], "md5": m["md5"], "doc_id": doc_id,
+               "drive_file_id": m["fid"], "filename": m.get("filename", ""),
+               "doc_number": number, "supplier": _safe_part(supplier, 40),
+               "ts": now_ts()}
+        reg_rows.append(row)
+        ctx["known_sha"][m["sha256"]] = row
+        if m["md5"]:
+            ctx["known_md5"][m["md5"]] = row
+    try:
+        rc.append_rows(ctx["files_ws"], ctx["files_headers"], reg_rows)
+    except Exception as e:
+        rc.log("Recv_Files append failed: %s" % e)
+
+    for i, m in enumerate(file_meta, start=1):
+        try:
+            meta = rc.drive_get_meta(m["fid"])
+            name = meta.get("name", "") or m.get("filename", "")
+        except Exception:
+            name = m.get("filename", "")
+        ext = ("." + name.rsplit(".", 1)[-1]) if ("." in (name or "")) else ""
+        suffix = ("_str%d" % i) if multi else ""
+        _move_processed(m["fid"], base + suffix + ext)
 
 
 if __name__ == "__main__":
