@@ -330,6 +330,39 @@ def append_rows(ws, headers, dict_rows):
                    table_range="A%d" % HEADER_ROW)
 
 
+def delete_rows_where(ws, headers, column_name, value):
+    # Delete every DATA row whose `column_name` equals `value`. Used to make a
+    # re-parse idempotent: clear a doc's old Recv_Lines before writing the fresh
+    # set, so N re-runs give ONE line set, not the sum. Rows of other docs are
+    # untouched. One fresh read + one delete call per contiguous block; blocks are
+    # deleted bottom-up so physical row numbers stay valid while deleting.
+    if column_name not in headers:
+        return 0
+    col = headers.index(column_name)  # 0-based into each row list
+    vals = ws.get_all_values()
+    targets = []
+    for i in range(HEADER_ROW, len(vals)):  # data starts at 0-based index HEADER_ROW
+        row = vals[i]
+        cell = row[col] if col < len(row) else ""
+        if cell == value:
+            targets.append(i + 1)  # physical 1-based row number
+    if not targets:
+        return 0
+    targets.sort(reverse=True)
+    deleted = 0
+    lo = hi = targets[0]
+    for r in targets[1:]:
+        if r == lo - 1:
+            lo = r
+        else:
+            ws.delete_rows(lo, hi)
+            deleted += hi - lo + 1
+            lo = hi = r
+    ws.delete_rows(lo, hi)
+    deleted += hi - lo + 1
+    return deleted
+
+
 def set_cell(ws, headers, row_number, column_name, value):
     if column_name not in headers:
         raise RuntimeError("column not found: " + column_name)

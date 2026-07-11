@@ -1102,14 +1102,24 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         rc.log("dry: not writing doc %s (%d lines)" % (doc_id, len(line_records)))
         return
 
-    # Double-append guard (item 1): never write a second copy of the lines for a
-    # doc that already had them at the start of THIS run (e.g. a crash between
-    # line-write and status-update left status=parsing). It does NOT protect two
-    # ingests running concurrently - the --if-requested scan_done claim serializes
-    # the trigger cron for that. --force reprocesses on purpose, so it is exempt.
-    if not ctx["force"] and doc_id in ctx["existing_line_doc_ids"]:
-        rc.log("doc %s: already has lines -> skip re-append (no doubling)" % doc_id)
+    # Line write - idempotent per doc_id:
+    #  * non-force run, doc already has lines: this is crash recovery (lines were
+    #    written, status not updated). The existing lines are correct -> keep them,
+    #    only fix the doc status below. Never append a second copy.
+    #  * --redo/--force (or any re-parse that reaches here with existing lines):
+    #    REPLACE, don't append. Delete this doc's old rows FIRST, then write the
+    #    fresh set, so N re-runs converge to ONE current line set (not 22+11=33).
+    #    Only this doc_id's rows are touched.
+    # This does NOT guard two ingests running concurrently - the --if-requested
+    # scan_done claim serializes the trigger cron for that.
+    already = doc_id in ctx["existing_line_doc_ids"]
+    if already and not ctx["force"]:
+        rc.log("doc %s: already has lines -> keep, skip re-append (no doubling)" % doc_id)
     else:
+        if already:
+            removed = rc.delete_rows_where(lines_ws, line_headers, "doc_id", doc_id)
+            rc.log("doc %s: re-parse -> deleted %d old line(s) before writing %d new"
+                   % (doc_id, removed, len(line_records)))
         rc.append_rows(lines_ws, line_headers, line_records)
         ctx["existing_line_doc_ids"].add(doc_id)
 
