@@ -101,6 +101,13 @@ def dedup_parsed_lines(lines):
         # A wholly empty key (no name at all) is not a meaningful dup signal.
         if name and key in seen:
             removed += 1
+            # Never collapse a line silently: log the exact repeat we drop so a
+            # real under-count (if the key ever proves too loose) is visible.
+            rc.log("dedup: exact repeat collapsed: %r qty=%s unit=%s cena=%s suma=%s"
+                   % (ln.get("raw_name"), _num_key(ln.get("raw_qty")),
+                      (ln.get("raw_unit") or "").strip(),
+                      _num_key(ln.get("raw_unit_price")),
+                      _num_key(ln.get("raw_line_total"))))
             continue
         seen.add(key)
         out.append(ln)
@@ -382,49 +389,98 @@ def dict_match(line, supplier_id, dict_idx):
     return None
 
 
-def llm_match_batch(lines, catalog, match_prompt):
-    # One LLM call: map raw line names to catalog productIds using the MATCH
+def _candidates_from_match(m):
+    # Extract the sorted candidate list from one match object. New shape:
+    # candidates[]; the old single-productId shape is tolerated.
+    raw_cands = m.get("candidates")
+    if raw_cands is None and m.get("productId") is not None:
+        raw_cands = [{"productId": m.get("productId"), "confidence": m.get("confidence", 0.0)}]
+    cands = []
+    for c in (raw_cands or []):
+        pid = str(c.get("productId", "") or "")
+        try:
+            conf = float(c.get("confidence", 0.0))
+        except Exception:
+            conf = 0.0
+        if pid:
+            cands.append({"productId": pid, "confidence": conf})
+    cands.sort(key=lambda x: x["confidence"], reverse=True)
+    return cands[:3]
+
+
+def llm_match_batch(items, catalog, match_prompt):
+    # One LLM call: map raw delivery lines to catalog productIds using the MATCH
     # prompt (confidence bands + type-mismatch penalty live in that prompt).
-    # Returns {line_index: {"productId":..., "confidence":...}}. Empty on failure.
-    if not lines or not catalog:
+    # `items` is a list of (ref, line) where ref is the STABLE index of the line
+    # in the final (already-deduped) line list. Returns {ref: [candidate, ...]}
+    # keyed by that SAME ref. Empty on failure.
+    #
+    # The match is anchored to the LINE, never to list position: we send each
+    # line's ref and require the model to ECHO the raw_name back. A returned match
+    # is trusted for a ref only when the echoed name matches that line; when the
+    # model's index drifts (long produce lists with near-identical names used to
+    # desync by one - e.g. MORELA taking OGOREK's match), the echoed name that
+    # belongs to a DIFFERENT line reveals the swap and we rebind by name so every
+    # line gets the match computed FOR IT (or none - we never apply another line's
+    # match to it).
+    if not items or not catalog:
         return {}
     cat = catalog[:800]
     cat_lines = "\n".join(
         "%s\t%s\t%s" % (c.get("productId", ""), c.get("name", ""), c.get("domain", ""))
         for c in cat
     )
-    items = "\n".join("%d\t%s" % (i, (l.get("raw_name") or "")) for i, l in enumerate(lines))
+    line_txt = "\n".join("%d\t%s" % (ref, (l.get("raw_name") or "")) for ref, l in items)
     prompt = (
         match_prompt
         + "\n\nCATALOG (productId<TAB>name<TAB>domain):\n" + cat_lines
-        + "\n\nLINES (index<TAB>raw_name):\n" + items + "\n"
+        + "\n\nLINES (index<TAB>raw_name):\n" + line_txt + "\n"
     )
     try:
         obj = rc.infer_text(prompt)
     except Exception as e:
         rc.log("llm match failed: %s" % e)
         return {}
-    out = {}
+
+    want_name = dict((ref, norm_name(l.get("raw_name"))) for ref, l in items)
+    our_names = set(v for v in want_name.values() if v)
+    by_index = {}   # ref -> (cands, echoed_norm_name)
+    by_name = {}    # norm_name -> cands (first non-empty answer for that name wins)
     for m in obj.get("matches", []):
+        cands = _candidates_from_match(m)
+        echoed = norm_name(m.get("name")) if m.get("name") is not None else ""
         try:
-            idx = int(m["index"])
+            ref = int(m["index"])
         except Exception:
-            continue
-        cands = []
-        # New shape: candidates[]; tolerate the old single productId shape too.
-        raw_cands = m.get("candidates")
-        if raw_cands is None and m.get("productId") is not None:
-            raw_cands = [{"productId": m.get("productId"), "confidence": m.get("confidence", 0.0)}]
-        for c in (raw_cands or []):
-            pid = str(c.get("productId", "") or "")
-            try:
-                conf = float(c.get("confidence", 0.0))
-            except Exception:
-                conf = 0.0
-            if pid:
-                cands.append({"productId": pid, "confidence": conf})
-        cands.sort(key=lambda x: x["confidence"], reverse=True)
-        out[idx] = cands[:3]
+            ref = None
+        if ref is not None and ref in want_name and ref not in by_index:
+            by_index[ref] = (cands, echoed)
+        if echoed and echoed not in by_name:
+            by_name[echoed] = cands
+
+    out = {}
+    realigned = 0
+    for ref, l in items:
+        want = want_name[ref]
+        entry = by_index.get(ref)
+        if entry is not None:
+            cands, echoed = entry
+            # Only override when the echoed name is DEFINITELY another line's name
+            # (a genuine index swap). A mere paraphrase (echoed name not among our
+            # lines) is trusted as this line's answer - dropping it would turn a
+            # good match into a needless "unmatched".
+            if echoed and want and echoed != want and echoed in our_names:
+                realigned += 1
+                if want in by_name:
+                    out[ref] = by_name[want]  # this line's real answer, by name
+                # else: no name-anchored answer for this line -> leave unmatched,
+                # never apply the other line's candidates to it.
+                continue
+            out[ref] = cands
+        elif want and want in by_name:
+            out[ref] = by_name[want]
+    if realigned:
+        rc.log("llm match: %d line(s) had index drift -> rebound by name" % realigned)
     return out
 
 
@@ -993,9 +1049,12 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         line_records.append(rec)
 
     if unmatched_for_llm:
-        matches = llm_match_batch([l for _, l in unmatched_for_llm], catalog, match_prompt)
-        for pos, (i, ln) in enumerate(unmatched_for_llm):
-            cands = matches.get(pos) or []
+        # Key the matcher on the STABLE line index i (not list position), so the
+        # returned match binds to the exact line it was computed for even if some
+        # lines were dict-matched or the model's index drifts (see llm_match_batch).
+        matches = llm_match_batch(unmatched_for_llm, catalog, match_prompt)
+        for i, ln in unmatched_for_llm:
+            cands = matches.get(i) or []
             rec = line_records[i]
             primary = cands[0] if cands else None
             conf = primary["confidence"] if primary else 0.0

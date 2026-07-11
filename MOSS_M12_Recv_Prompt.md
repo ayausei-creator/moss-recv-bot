@@ -116,6 +116,8 @@ one tap between close variants (e.g. "Migdal platki" / "Migdal caly" /
 option, return one; if none, return an empty candidates list.
 
 Return STRICT JSON only, no prose, no code fences:
-{"matches":[{"index":int,"candidates":[{"productId":"","confidence":0.0}]}]}
-Use the exact line index given in the input. Every productId must come from the
-provided CATALOG. Order candidates by confidence, highest first.
+{"matches":[{"index":int,"name":"<raw_name of that line, copied VERBATIM>","candidates":[{"productId":"","confidence":0.0}]}]}
+Return one object per input line. Use the exact line index given in the input AND
+copy that line's raw_name back into "name" character-for-character (this anchors
+the mapping so a match can never land on the wrong line). Every productId must
+come from the provided CATALOG. Order candidates by confidence, highest first.
