@@ -55,6 +55,17 @@ def now_ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _claim_age_seconds(stamp):
+    # Age in seconds of a "YYYY-MM-DD HH:MM:SS" claim timestamp (local time, same
+    # clock that wrote it). None if unparseable. Used for the doc-claim freshness
+    # check (brief batch2 sec.5).
+    try:
+        t = time.mktime(time.strptime(stamp.strip(), "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, TypeError):
+        return None
+    return max(0, int(time.time() - t))
+
+
 def norm_name(s):
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9]+", " ", s)
@@ -847,6 +858,15 @@ def main():
         args.doc = args.redo
         args.force = True
 
+    # Cross-process mutex (brief batch2 sec.5, level 1): the */5 ingest and the
+    # */3 --if-requested trigger must never parse concurrently. A second run that
+    # cannot get the lock exits silently (0), so cron does not alert on it.
+    if not rc.acquire_singleton_lock():
+        rc.log("ingest: another run active (lock busy) -> exit 0")
+        return 0
+    run_id = uuid.uuid4().hex[:12]
+    rc.log("ingest: run_id=%s holds the ingest lock" % run_id)
+
     # Light trigger for the "Rozpoznaj" button: bail out immediately unless the
     # app queued a fresh request. Checked BEFORE loading prompts / opening the
     # data tabs / scanning Drive, so an idle every-minute run costs one tiny read.
@@ -1047,6 +1067,7 @@ def main():
         "csv_templates_ws": csv_templates_ws,
         "csv_templates": csv_templates,
         "csv_supplier_nip": "",
+        "run_id": run_id,
     }
     for d in todo:
         try:
@@ -1072,6 +1093,22 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
     doc_id = d.get("doc_id")
     source = (d.get("source") or "").strip()
     rc.log("--- doc %s source=%s ---" % (doc_id, source))
+
+    # Level-2 claim (brief batch2 sec.5): if another run stamped a FRESH claim on
+    # this doc, skip it (defense-in-depth beyond the process lock). Otherwise stamp
+    # our own claim so any later run sees this doc is being processed. --redo/--force
+    # ignores a stale claim by design (manual re-test). Skipped in --dry.
+    if not dry:
+        claimed_at = (d.get("claimed_at") or "").strip()
+        claimed_by = (d.get("claimed_by") or "").strip()
+        if claimed_at and claimed_by and claimed_by != ctx.get("run_id"):
+            age = _claim_age_seconds(claimed_at)
+            if age is not None and age < rc.CLAIM_FRESH_SECONDS and not ctx.get("force"):
+                rc.log("doc %s: fresh claim by run %s (%ss ago) -> skip (another run active)"
+                       % (doc_id, claimed_by, age))
+                return
+        _set_doc(docs_ws, doc_headers, d,
+                 {"claimed_at": now_ts(), "claimed_by": ctx.get("run_id", "")}, dry)
 
     file_meta = []  # per parsed page: {"sha256","md5","fid","filename"}
     parsed = None
@@ -1324,26 +1361,19 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         rc.log("dry: not writing doc %s (%d lines)" % (doc_id, len(line_records)))
         return
 
-    # Line write - idempotent per doc_id:
-    #  * non-force run, doc already has lines: this is crash recovery (lines were
-    #    written, status not updated). The existing lines are correct -> keep them,
-    #    only fix the doc status below. Never append a second copy.
-    #  * --redo/--force (or any re-parse that reaches here with existing lines):
-    #    REPLACE, don't append. Delete this doc's old rows FIRST, then write the
-    #    fresh set, so N re-runs converge to ONE current line set (not 22+11=33).
-    #    Only this doc_id's rows are touched.
-    # This does NOT guard two ingests running concurrently - the --if-requested
-    # scan_done claim serializes the trigger cron for that.
+    # Line write - REPLACE by doc_id is the ONLY path (brief batch2 sec.5, level 3).
+    # Always delete this doc's existing rows FIRST, then write the fresh set, so a
+    # crash-recovery re-parse OR a --redo/--force OR two runs that both reached here
+    # converge to ONE current line set (never 26+26=52). Only this doc_id's rows are
+    # touched. Combined with the process lock (level 1) and the doc claim (level 2),
+    # a plain append can no longer double a document.
     already = doc_id in ctx["existing_line_doc_ids"]
-    if already and not ctx["force"]:
-        rc.log("doc %s: already has lines -> keep, skip re-append (no doubling)" % doc_id)
-    else:
-        if already:
-            removed = rc.delete_rows_where(lines_ws, line_headers, "doc_id", doc_id)
-            rc.log("doc %s: re-parse -> deleted %d old line(s) before writing %d new"
-                   % (doc_id, removed, len(line_records)))
-        rc.append_rows(lines_ws, line_headers, line_records)
-        ctx["existing_line_doc_ids"].add(doc_id)
+    if already:
+        removed = rc.delete_rows_where(lines_ws, line_headers, "doc_id", doc_id)
+        rc.log("doc %s: replace-by-doc_id -> deleted %d old line(s) before writing %d new"
+               % (doc_id, removed, len(line_records)))
+    rc.append_rows(lines_ws, line_headers, line_records)
+    ctx["existing_line_doc_ids"].add(doc_id)
 
     patch = {
         "status": status,
@@ -1451,7 +1481,8 @@ def _register_and_move(ctx, d, parsed, doc_date, file_meta, net_total):
         row = {"sha256": m["sha256"], "md5": m["md5"], "doc_id": doc_id,
                "drive_file_id": m["fid"], "filename": m.get("filename", ""),
                "doc_number": number, "supplier": _safe_part(supplier, 40),
-               "ts": now_ts()}
+               "ts": now_ts(),
+               "claimed_at": now_ts(), "claimed_by": ctx.get("run_id", "")}
         reg_rows.append(row)
         ctx["known_sha"][m["sha256"]] = row
         if m["md5"]:

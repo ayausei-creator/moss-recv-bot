@@ -20,6 +20,11 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
+try:
+    import fcntl  # POSIX only; present on the Linux VPS the bot runs on.
+except ImportError:  # pragma: no cover - non-POSIX dev boxes
+    fcntl = None
+
 # ---------------------------------------------------------------------------
 # Constants (this server / this cloud). No secrets here - tokens are read from
 # files in SECRETS_DIR at runtime.
@@ -94,7 +99,20 @@ CSV_TEMPLATES_HEADERS = ["supplier_nip", "header_signature", "mapping_json",
 # silently (brief item 2). Never used to reject a mere re-scan of the same
 # drive_file_id (that is handled by known_file_ids), only true content dups.
 FILES_HEADERS = ["sha256", "md5", "doc_id", "drive_file_id",
-                 "filename", "doc_number", "supplier", "ts"]
+                 "filename", "doc_number", "supplier", "ts",
+                 # batch2 sec.5: file/doc claim for the double-processing guard.
+                 "claimed_at", "claimed_by"]
+
+# How long a claim (Recv_Docs.claimed_at / Recv_Files.claimed_at) is honored: a
+# doc claimed more recently than this by ANOTHER run is skipped (brief batch2
+# sec.5). Long enough to cover a slow parse, short enough that a crashed run
+# does not wedge a document forever.
+CLAIM_FRESH_SECONDS = int(os.environ.get("M12_CLAIM_FRESH_SECONDS", "900") or "900")
+
+# Cross-process mutex so the */5 ingest cron and the */3 --if-requested trigger
+# never parse the same inbox concurrently (brief batch2 sec.5). A whole run holds
+# the lock; a second run that cannot get it exits at once.
+INGEST_LOCK_PATH = "/tmp/m12_ingest.lock"
 
 # Subfolder of the WZ inbox where successfully parsed files are moved so the
 # inbox always shows only what still needs work (brief item 4).
@@ -120,6 +138,32 @@ def log(msg):
 
 def today_str():
     return time.strftime("%Y-%m-%d")
+
+
+# Held for the process lifetime so the OS releases it automatically on exit; kept
+# in a module global so the file object is not garbage-collected mid-run.
+_INGEST_LOCK_FH = None
+
+
+def acquire_singleton_lock(path=INGEST_LOCK_PATH):
+    # Non-blocking exclusive flock (brief batch2 sec.5). Returns True if THIS
+    # process now holds the lock, False if another run holds it. On a platform
+    # without fcntl we degrade to "always acquired" (dev boxes; the VPS is POSIX).
+    global _INGEST_LOCK_FH
+    if fcntl is None:
+        return True
+    try:
+        fh = open(path, "w")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        return False
+    _INGEST_LOCK_FH = fh  # keep the fd open for the whole run
+    try:
+        fh.write("%d\n" % os.getpid())
+        fh.flush()
+    except Exception:
+        pass
+    return True
 
 
 def backup_file(path):
