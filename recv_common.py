@@ -53,6 +53,21 @@ LLM_TEXT_FALLBACK = "openai/gpt-5.5"
 MATCH_THRESHOLD = 0.75
 HEADER_ROW = 2  # column names live in row 2; data starts at row 3
 
+# The buyer is ALWAYS this NIP (Kawiarnia Moss / Fortbolt). A parsed document
+# that puts this NIP as the supplier has the parties swapped - the ingest fixes
+# it (brief batch2 sec.2.5). Kept here so both parse post-processing and any
+# future check share one source of truth.
+BUYER_NIP = "5252948161"
+
+# Server-side self-check thresholds (brief batch2 sec.2.2). Constants for now;
+# a later batch may move them to a config tab.
+#  rachunek?  -> |qty_doc*price_doc_net - total_doc_net| > max(abs, rel*total)
+#  cena?      -> price_skl outside [ref*CENA_LO .. ref*CENA_HI]
+RACHUNEK_ABS_PLN = 0.02
+RACHUNEK_REL = 0.005
+CENA_LO = 0.5
+CENA_HI = 2.0
+
 # Sheet tab names (contract with the manager app, brief sec.4).
 TAB_DOCS = "Recv_Docs"
 TAB_LINES = "Recv_Lines"
@@ -63,6 +78,15 @@ TAB_KOSZT = "Recv_Koszt"
 TAB_TASKS = "Recv_Tasks"
 TAB_CONTROL = "Recv_Control"
 TAB_FILES = "Recv_Files"
+TAB_CSV_TEMPLATES = "Recv_CsvTemplates"
+
+# Recv_CsvTemplates - per-supplier CSV column mapping (brief batch2 sec.2.4). The
+# first CSV of a supplier is mapped by the LLM; the confirmed mapping is stored
+# here (keyed by supplier NIP + a signature of the header row) so subsequent CSVs
+# parse deterministically with no LLM call. header_signature is a stable hash of
+# the lowercased, trimmed column names.
+CSV_TEMPLATES_HEADERS = ["supplier_nip", "header_signature", "mapping_json",
+                         "confirmed", "created_at"]
 
 # Recv_Files - registry of processed source files (exact-duplicate guard, audit).
 # One row per physical file the bot has parsed. sha256/md5 are content hashes of
@@ -654,6 +678,32 @@ def to_float(v):
 
 def is_true(v):
     return str(v or "").strip().lower() in ("true", "prawda", "1", "yes", "tak")
+
+
+def mem_norm_name(s):
+    # SKU-memory name normalization (brief batch2 sec.2.3): trim, lower, collapse
+    # runs of whitespace. Deliberately simpler than match norm_name (which strips
+    # punctuation) so the memory key stays close to the printed name.
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def mem_key(supplier_nip, raw_name, raw_supplier_code=""):
+    # Memory lookup key (brief batch2 sec.2.3). A supplier article code / EAN, when
+    # present, is more reliable than the name and takes priority. Otherwise
+    # supplier_nip + normalized name. Independent of document type (WZ or faktura).
+    nip = re.sub(r"\D", "", supplier_nip or "")
+    code = (raw_supplier_code or "").strip().lower()
+    if code:
+        return "%s|code|%s" % (nip, code)
+    return "%s|name|%s" % (nip, mem_norm_name(raw_name))
+
+
+def csv_header_signature(header_cells):
+    # Stable signature of a CSV header row for Recv_CsvTemplates (brief batch2
+    # sec.2.4): lowercased, trimmed, order-preserving, joined, hashed.
+    cells = [re.sub(r"\s+", " ", (c or "").strip().lower()) for c in (header_cells or [])]
+    basis = "|".join(cells)
+    return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
 
 
 def load_cursor(name):

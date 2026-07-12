@@ -16,10 +16,15 @@ image, a PDF page rendered to an image, or plain text. Output STRICT JSON only.
 No prose, no markdown, no code fences. If a field is unknown, use an empty
 string "" (never guess).
 
+GOLDEN RULE: transcribe ONLY what is PRINTED in the table columns. Do NOT
+multiply, divide, or recompute anything. The quantity is whatever the "Ilosc"
+column says - never a number taken from the product name. A number inside the
+name (a factory pack size or carton count) is NOT the quantity.
+
 Output schema:
 
 {
-  "supplier_name": "string, as printed",
+  "supplier_name": "string, as printed (the SELLER / wystawca)",
   "supplier_nip": "digits only, no spaces or dashes, empty if none",
   "doc_number": "invoice / WZ / receipt number as printed",
   "doc_date": "YYYY-MM-DD (issue date). Empty if not readable",
@@ -29,14 +34,14 @@ Output schema:
     {
       "raw_name": "item name exactly as printed",
       "raw_supplier_code": "supplier article/EAN code if present, else empty",
-      "raw_qty": "printed quantity as a number (as it appears), dot decimal",
-      "raw_unit": "unit as printed next to the quantity: kg, l, szt, opak, ...",
-      "pack_count": "number of PACKAGES/pieces bought (see packaging rules)",
-      "pack_size": "size of ONE package in the base unit (e.g. 2.5 for 2,5 kg)",
-      "pack_unit": "base unit of pack_size: kg, l, szt (the warehouse unit)",
-      "raw_unit_price": "net unit price as a number, dot decimal",
-      "raw_line_total": "net line total as a number, dot decimal",
-      "vat_rate": "VAT percent as a number: 5, 8, 23 (empty if unknown)"
+      "qty_doc": "the number printed in the Ilosc column, dot decimal",
+      "unit_doc": "the unit printed in the j.m. column: kg, l, szt, op, ...",
+      "price_doc_net": "net unit price (Cena jedn. netto) as printed, dot decimal",
+      "total_doc_net": "net line total (Wartosc netto) as printed, dot decimal",
+      "vat_rate": "VAT percent as a number: 5, 8, 23 (empty if unknown)",
+      "unit_content": "size of ONE document unit in the warehouse base unit, ONLY when explicitly printed in the name (see rules); else empty",
+      "unit_skl": "warehouse base unit implied by unit_content: kg, l, or szt; else empty",
+      "carton_hint": "factory carton note from the name suffix (/N, (N), xN); reference only; else empty"
     }
   ]
 }
@@ -44,27 +49,39 @@ Output schema:
 Rules:
 - Numbers: use a dot decimal separator. Strip currency symbols and thousand
   separators. "1 234,50" -> "1234.50".
-- PACKAGING - split quantity from package size. The warehouse counts in a base
-  unit (kg, l, szt), but documents often print "size/count" or "count x size":
-    * "Czekolada 2,5kg/8"  -> pack_count=8, pack_size=2.5, pack_unit=kg
-      (eight 2.5 kg packages; NOT quantity 2.5).
-    * "Mleko 1L x 12"      -> pack_count=12, pack_size=1, pack_unit=l
-    * "Cukier 10 kg"       -> pack_count=1, pack_size=10, pack_unit=kg
-    * "Woda 0,5L 24szt"    -> pack_count=24, pack_size=0.5, pack_unit=l
-    * "Jajka 30 szt"       -> pack_count=30, pack_size=1, pack_unit=szt
-  If you cannot confidently separate count and size, leave pack_count and
-  pack_size EMPTY (the bot will flag the line for the manager). Never guess a
-  multiplier.
-- raw_qty / raw_unit stay as printed (for reference). pack_* is your best
-  structured reading of the packaging.
+- COLUMNS ONLY. qty_doc = the Ilosc column. unit_doc = the j.m. column.
+  price_doc_net = Cena jednostkowa netto. total_doc_net = Wartosc netto.
+  vat_rate = VAT. Copy them verbatim. Do NOT compute one column from another and
+  do NOT use a number from the name as a quantity.
+- unit_content: fill ONLY when the size of ONE unit is explicitly PRINTED in the
+  name, then convert to the warehouse base unit (ml -> l, g -> kg):
+    * "...750ml..."     -> unit_content=0.75, unit_skl=l
+    * "...950g..."      -> unit_content=0.95, unit_skl=kg
+    * "...2,5kg..."     -> unit_content=2.5,  unit_skl=kg
+    * "...5g x200 1kg..."-> unit_content=1,   unit_skl=kg  (total mass printed)
+  If the name has NO explicit single-unit size, or it is ambiguous
+  (e.g. "2,5kg/1,5kg"), leave unit_content AND unit_skl EMPTY. Never guess.
+- carton_hint: a suffix like "/8", "(8)", or "x8" WITHOUT a unit is a factory
+  carton/count. Put it in carton_hint for reference ONLY. It is NOT the quantity
+  and NOT a multiplier. Example: "ALPRO ...750ml BARISTA (8)" -> carton_hint="(8)",
+  unit_content=0.75, unit_skl=l  (the "(8)" never becomes a number of litres).
+- SELF-CHECK: if qty_doc * price_doc_net is clearly not equal to total_doc_net
+  (tolerance 0.02 PLN or 0.5%), re-read that row. If it still does not reconcile,
+  leave the values EXACTLY as printed - the server will flag the row. Do not
+  "fix" numbers to make them add up.
+- PARTIES: the participant with NIP 5252948161 is ALWAYS the buyer (Kawiarnia
+  Moss / Fortbolt). supplier_name / supplier_nip must be the OTHER party
+  (sprzedawca / wystawca). Never put the buyer as the supplier.
 - Prices are NET where the document shows both; if only gross is shown, put the
-  gross value and leave vat_rate so the human can adjust.
+  gross value and leave vat_rate so the human can adjust. Price/total are
+  OPTIONAL - a WZ without prices is normal; leave them empty then.
 - One object per physical line item. Do not merge or split lines. Skip
   summary/total rows.
 - NEVER repeat a line. Each physical position on the document appears EXACTLY
   ONCE in "lines". Do not output the same item twice, and do not restart the
   list from the top. If the document has 11 positions, return exactly 11 objects.
-- Do not invent products, codes, or prices. Empty string when unsure.
+- Do not invent products, codes, or prices. Empty string when unsure. An empty
+  field is always better than a guess.
 - Keep the item name in the original language of the document.
 - Return ONLY the JSON object described above.
 

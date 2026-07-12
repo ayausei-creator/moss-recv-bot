@@ -27,7 +27,8 @@ KITCHEN_KW = ["skladnik", "mleko", "nabial", "opakowanie", "warzyw", "owoc",
 SHELF_KW = ["sklep", "woda", "napoj", "sok", "piwo", "wino", "alko",
             "syrop", "herbat", "kawa-herb"]
 
-CATALOG_HEADERS = ["productId", "name", "category", "unit", "domain", "packaging_hint"]
+CATALOG_HEADERS = ["productId", "name", "category", "unit", "domain",
+                   "packaging_hint", "last_purchase_price"]
 
 
 # Archive/inactive is decided by CATEGORY NAME + the product `deleted` flag only.
@@ -78,6 +79,17 @@ def _unit_of(prod):
     return ""
 
 
+def _purchase_price(wp):
+    # Net purchase price of a warehouse product across known field spellings.
+    for k in ("purchasePriceWithoutVat", "purchasePrice", "purchase_price",
+              "lastPurchasePrice", "priceWithoutVat"):
+        v = wp.get(k)
+        f = rc.to_float(v)
+        if f is not None and f > 0:
+            return f
+    return None
+
+
 def _packaging_hint(prod):
     # Best-effort hint from a note/description field; empty if none.
     for k in ("note", "description", "packaging"):
@@ -122,6 +134,20 @@ def main():
     products = doty.products()
     rc.log("catalog: total products fetched: %d" % len(products))
 
+    # Warehouse purchase price per product -> Recv_Catalog.last_purchase_price, the
+    # reference the ingest cena? control compares against (brief batch2 sec.2.2).
+    price_by_pid = {}
+    try:
+        for wp in doty.warehouse_products():
+            pid = str(wp.get("_productId") or wp.get("productId")
+                      or wp.get("id") or wp.get("_id") or "")
+            pp = _purchase_price(wp)
+            if pid and pp is not None:
+                price_by_pid[pid] = pp
+        rc.log("catalog: purchase prices for %d warehouse products" % len(price_by_pid))
+    except Exception as e:
+        rc.log("catalog: warehouse price read failed (%s); last_purchase_price empty" % e)
+
     # Count products per category (all + active) to expose real coverage.
     total_by_cat = {}
     active_by_cat = {}
@@ -160,6 +186,7 @@ def main():
         name = (p.get("name") or "").strip()
         if not pid or not name:
             continue
+        pp = price_by_pid.get(pid)
         rows.append({
             "productId": pid,
             "name": name,
@@ -167,6 +194,7 @@ def main():
             "unit": _unit_of(p),
             "domain": domain,
             "packaging_hint": _packaging_hint(p),
+            "last_purchase_price": ("%.4f" % pp) if pp is not None else "",
         })
         per_cat[cat_name] = per_cat.get(cat_name, 0) + 1
 

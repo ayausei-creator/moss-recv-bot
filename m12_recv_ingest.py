@@ -77,6 +77,17 @@ def _num_key(v):
     return str(v or "").strip().replace(",", ".")
 
 
+def _df(ln, *names):
+    # First non-empty value among the given field names. Lets the new document-
+    # layer schema (qty_doc/unit_doc/price_doc_net/total_doc_net) fall back to the
+    # legacy raw_* names so old parses and re-parses both work.
+    for n in names:
+        v = ln.get(n)
+        if v is not None and str(v).strip() != "":
+            return v
+    return ""
+
+
 def dedup_parsed_lines(lines):
     # Drop positions repeated inside ONE parse (brief item 1). The LLM sometimes
     # emits the same physical line twice (Maracana WZ came back doubled). The key
@@ -92,11 +103,11 @@ def dedup_parsed_lines(lines):
         name = norm_name(ln.get("raw_name"))
         key = "|".join([
             name,
-            _num_key(ln.get("raw_qty")),
-            (ln.get("raw_unit") or "").strip().lower(),
+            _num_key(_df(ln, "qty_doc", "raw_qty")),
+            (_df(ln, "unit_doc", "raw_unit") or "").strip().lower(),
             (ln.get("raw_supplier_code") or "").strip().lower(),
-            _num_key(ln.get("raw_unit_price")),
-            _num_key(ln.get("raw_line_total")),
+            _num_key(_df(ln, "price_doc_net", "raw_unit_price")),
+            _num_key(_df(ln, "total_doc_net", "raw_line_total")),
         ])
         # A wholly empty key (no name at all) is not a meaningful dup signal.
         if name and key in seen:
@@ -334,16 +345,29 @@ def parse_ksef_xml(path):
     return header
 
 
-def parse_document(source, local_path, prompt):
+# A native PDF is treated as text-layer when its extracted text clears this bar;
+# below it we render the page to an image for vision (brief batch2 sec.2.4).
+PDF_TEXT_MIN_CHARS = int(os.environ.get("M12_PDF_TEXT_MIN_CHARS", "200") or "200")
+
+
+def parse_document(source, local_path, prompt, ctx=None):
     if source in ("image", "wz_photo"):
+        rc.log("route=vision (%s)" % source)
         return rc.infer_vision(prompt, local_path)
     if source == "ksef_xml":
+        rc.log("route=ksef-xml")
         return parse_ksef_xml(local_path)
+    if source == "csv":
+        return parse_csv(local_path, prompt, ctx)
     if source == "pdf":
         txt = pdf_extract_text(local_path)
-        if txt.strip():
+        # A real text layer (native PDF): feed the exact text to the text model and
+        # DO NOT rasterize - keeps a perfect table perfect (brief batch2 sec.2.4).
+        if len(txt.strip()) >= PDF_TEXT_MIN_CHARS:
+            rc.log("route=pdf-text (%d chars)" % len(txt.strip()))
             return rc.infer_text(prompt + "\n\n=== DOCUMENT TEXT ===\n" + txt)
-        rc.log("pdf: no text layer, rendering page to image for vision")
+        rc.log("route=vision (pdf: no usable text layer, %d chars -> render page)"
+               % len(txt.strip()))
         png = pdf_render_png(local_path)
         if not png:
             raise RuntimeError(
@@ -358,28 +382,146 @@ def parse_document(source, local_path, prompt):
     return None  # manual / paragon: lines already present
 
 
+def parse_csv(local_path, prompt, ctx):
+    # CSV import v1 (brief batch2 sec.2.4). A confirmed per-supplier template
+    # (Recv_CsvTemplates, matched by header signature) parses deterministically
+    # with NO LLM. Otherwise the LLM proposes a column mapping, we parse with it,
+    # save the template UNCONFIRMED, and flag the doc "szablon do potwierdzenia".
+    import csv as _csv
+    with open(local_path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        sample = f.read()
+    try:
+        dialect = _csv.Sniffer().sniff(sample[:4096], delimiters=",;\t|")
+    except Exception:
+        class dialect:  # noqa: N801 - simple fallback dialect
+            delimiter = ";" if sample.count(";") > sample.count(",") else ","
+    reader = _csv.reader(sample.splitlines(), dialect)
+    table = [row for row in reader if any((c or "").strip() for c in row)]
+    if not table:
+        return {"lines": [], "notes": "csv: pusty plik"}
+    header = [(c or "").strip() for c in table[0]]
+    data = table[1:]
+    sig = rc.csv_header_signature(header)
+
+    tmpl = None
+    for t in (ctx or {}).get("csv_templates", []):
+        if (t.get("header_signature") or "").strip() == sig and rc.is_true(t.get("confirmed")):
+            tmpl = t
+            break
+
+    if tmpl:
+        rc.log("route=csv-template (sig %s, deterministic)" % sig)
+        mapping = {}
+        try:
+            mapping = json.loads(tmpl.get("mapping_json") or "{}")
+        except Exception:
+            mapping = {}
+        lines = _csv_apply_mapping(header, data, mapping)
+        return {"lines": lines}
+
+    # No confirmed template -> let the LLM map columns, then remember it.
+    rc.log("route=csv-llm (sig %s, szablon do potwierdzenia)" % sig)
+    preview = "\n".join(["\t".join(r) for r in table[:8]])
+    map_prompt = (
+        "You map columns of a supplier delivery CSV to a fixed schema. Return "
+        "STRICT JSON only: {\"mapping\":{\"raw_name\":\"<col>\",\"qty_doc\":\"<col>\","
+        "\"unit_doc\":\"<col>\",\"price_doc_net\":\"<col>\",\"total_doc_net\":\"<col>\","
+        "\"raw_supplier_code\":\"<col>\",\"vat_rate\":\"<col>\"}} where each <col> is "
+        "the EXACT header text of the matching column, or \"\" if absent. "
+        "Header row and a few data rows follow:\n" + preview
+    )
+    mapping = {}
+    try:
+        obj = rc.infer_text(map_prompt)
+        mapping = obj.get("mapping") or {}
+    except Exception as e:
+        rc.log("csv: LLM mapping failed: %s" % e)
+    lines = _csv_apply_mapping(header, data, mapping)
+    # Save the proposed template (unconfirmed) for the manager to confirm later.
+    if ctx and ctx.get("csv_templates_ws") is not None and mapping:
+        try:
+            row = {"supplier_nip": (ctx.get("csv_supplier_nip") or ""),
+                   "header_signature": sig,
+                   "mapping_json": json.dumps(mapping, ensure_ascii=True),
+                   "confirmed": "FALSE", "created_at": now_ts()}
+            rc.append_rows(ctx["csv_templates_ws"], rc.CSV_TEMPLATES_HEADERS, [row])
+            ctx.setdefault("csv_templates", []).append(row)
+        except Exception as e:
+            rc.log("csv: template save failed: %s" % e)
+    return {"lines": lines, "notes": "csv: szablon do potwierdzenia"}
+
+
+def _csv_apply_mapping(header, data, mapping):
+    # Build document-layer lines from a CSV using a {schema_field: header} mapping.
+    idx = {}
+    for field, col in (mapping or {}).items():
+        col = (col or "").strip()
+        if col and col in header:
+            idx[field] = header.index(col)
+    out = []
+    for row in data:
+        def cell(field):
+            j = idx.get(field)
+            return (row[j].strip() if (j is not None and j < len(row)) else "")
+        name = cell("raw_name")
+        if not name:
+            continue
+        out.append({
+            "raw_name": name,
+            "raw_supplier_code": cell("raw_supplier_code"),
+            "qty_doc": _num_key(cell("qty_doc")),
+            "unit_doc": cell("unit_doc"),
+            "price_doc_net": _num_key(cell("price_doc_net")),
+            "total_doc_net": _num_key(cell("total_doc_net")),
+            "vat_rate": cell("vat_rate"),
+        })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # matching
 # ---------------------------------------------------------------------------
 def build_dict_index(dict_rows):
+    # Index Recv_Dictionary by every key we may look it up by:
+    #   * the row's own `key` string (legacy: supplier_id|code or norm_name)
+    #   * the SKU-memory key mem_key(supplier_nip, name/code) when the row carries
+    #     supplier_nip (brief batch2 sec.2.3), so memory written by the app is
+    #     found here at parse time.
+    # Each entry carries both the legacy match fields AND the new translator/price
+    # memory fields (unit_content, unit_skl, last_price_skl, tryb).
     idx = {}
     for r in dict_rows:
-        key = (r.get("key") or "").strip().lower()
-        if not key:
-            continue
-        idx[key] = {
-            "match_productId": r.get("match_productId", ""),
+        entry = {
+            "match_productId": r.get("match_productId", "") or r.get("productId", ""),
             "canonical_unit": r.get("canonical_unit", ""),
             "pack_factor": rc.to_float(r.get("pack_factor")) or 1.0,
             "confidence": rc.to_float(r.get("confidence")) or 0.9,
             "domain": r.get("domain", ""),
+            # SKU-memory (batch2)
+            "unit_content": rc.to_float(r.get("unit_content")),
+            "unit_skl": (r.get("unit_skl") or "").strip(),
+            "last_price_skl": rc.to_float(r.get("last_price_skl")),
+            "tryb": (r.get("tryb") or "").strip(),
         }
+        key = (r.get("key") or "").strip().lower()
+        if key:
+            idx.setdefault(key, entry)
+        nip = re.sub(r"\D", "", r.get("supplier_nip") or "")
+        if nip:
+            code = (r.get("raw_supplier_code") or "").strip()
+            name = r.get("raw_name") or ""
+            mk = rc.mem_key(nip, name, code)
+            idx.setdefault(mk, entry)
     return idx
 
 
-def dict_match(line, supplier_id, dict_idx):
+def dict_match(line, supplier_id, supplier_nip, dict_idx):
+    # Look up the learned binding/memory for a line. Priority: supplier code /
+    # EAN, then supplier_nip + name (SKU memory), then legacy keys.
     code = (line.get("raw_supplier_code") or "").strip()
     keys = []
+    if supplier_nip:
+        keys.append(rc.mem_key(supplier_nip, line.get("raw_name"), code))
     if supplier_id and code:
         keys.append(("%s|%s" % (supplier_id, code)).lower())
     keys.append(norm_name(line.get("raw_name")))
@@ -520,77 +662,120 @@ def normalize_unit(u):
     return (None, None)
 
 
-def compute_qty(line, dict_packf, target_unit):
-    # Quantity in the MATCHED INGREDIENT's unit (target_unit from Recv_Catalog).
-    # Converts across the same dimension (g<->kg, ml<->l). If the source cannot
-    # be converted to the ingredient unit (e.g. pieces to kg with no weight),
-    # we DO NOT guess: unit_flag + empty qty ("przelicz recznie").
-    # Returns (canonical_qty, canonical_unit, qty_breakdown, unit_flag).
-    count = rc.to_float(line.get("pack_count"))
-    size = rc.to_float(line.get("pack_size"))
-    raw_qty = rc.to_float(line.get("raw_qty"))
-    punit = (line.get("pack_unit") or "").strip()
-    runit = (line.get("raw_unit") or "").strip()
-    tdim, tfac = normalize_unit(target_unit)
-    tunit = (target_unit or "").strip()
-
-    def to_target(amount, unit):
-        # amount in `unit` -> value in target unit, or (None,None) if it cannot
-        # be converted to the ingredient's dimension.
-        if amount is None:
-            return None, None
-        sdim, sfac = normalize_unit(unit)
-        if tdim is None:
-            # unknown ingredient unit -> keep source unit as-is (best effort)
-            return amount, (unit or tunit or "")
-        if sdim == tdim and sfac is not None:
-            return amount * sfac / tfac, tunit
-        return None, None  # dimension mismatch
-
-    def flag_manual():
-        hint = " (jednostka skladnika: %s)" % tunit if tunit else ""
-        return "", (tunit or punit or runit or ""), "przelicz recznie" + hint, True
-
-    # 1) clean pack decomposition: count x size in pack_unit (or raw unit)
-    if count and size and count > 0 and size > 0:
-        src_unit = punit or runit
-        val, u = to_target(count * size, src_unit)
-        if val is None:
-            return flag_manual()
-        bd = "%s x %s %s = %s %s" % (_fmt(count), _fmt(size), src_unit or "", _fmt(val), u)
-        return _fmt(val), u, bd, bool(val >= 100000)
-
-    # 2) learned pack factor from the dictionary (assumed already in target unit)
-    if dict_packf and dict_packf != 1.0 and raw_qty is not None:
-        canon = raw_qty * dict_packf
-        bd = "%s x %s = %s %s" % (_fmt(raw_qty), _fmt(dict_packf), _fmt(canon), tunit)
-        return _fmt(canon), (tunit or runit or ""), bd, bool(canon >= 100000 or dict_packf >= 1000)
-
-    # 3) plain quantity in the raw unit -> convert to ingredient unit
-    name = line.get("raw_name", "")
-    hint = re.search(r"(/\s*\d+|\d+\s*[x/]\s*\d+|\bx\s*\d+)", name, re.I)
-    if raw_qty is not None and not hint:
-        val, u = to_target(raw_qty, runit)
-        if val is not None:
-            bd = "" if (u == runit or not runit) else "%s %s = %s %s" % (_fmt(raw_qty), runit, _fmt(val), u)
-            return _fmt(val), u, bd, bool(val >= 100000)
-        if tdim is not None:
-            # raw unit incompatible with ingredient unit (e.g. szt vs kg) -> flag
-            return flag_manual()
-        return _fmt(raw_qty), (runit or ""), "", bool(raw_qty >= 100000)
-
-    # 4) not trustworthy -> flag, NO auto value
-    return flag_manual()
+# Base warehouse unit per measurement dimension.
+_BASE_NAME = {"mass": "kg", "vol": "l", "count": "szt"}
 
 
-def normalize_line(line, packf, canonical_unit):
-    raw_qty = rc.to_float(line.get("raw_qty"))
-    if raw_qty is None:
-        return "", False
-    canon = raw_qty * (packf or 1.0)
-    # unit guard: implausible blow-up (e.g. x1000 mistakes) -> flag
-    flag = canon >= 100000 or (packf and (packf >= 1000 or packf <= 0.0001))
-    return ("%g" % canon), bool(flag)
+def _skl_from_unit(u):
+    dim, _ = normalize_unit(u)
+    return _BASE_NAME.get(dim, "")
+
+
+def _carton_from_name(name):
+    # A trailing factory-carton hint: "(8)", "/8", "x8" WITHOUT a unit next to it.
+    # Reference only - NEVER a quantity or a multiplier (brief batch2 sec.2.1).
+    m = re.search(r"(?:\(\s*(\d+)\s*\)|/\s*(\d+)|[xX]\s*(\d+))\s*$", name or "")
+    if not m:
+        return ""
+    num = next((g for g in m.groups() if g), "")
+    return ("(%s)" % num) if num else ""
+
+
+def doc_layer(ln):
+    # The DOCUMENT layer: only what is printed in the table columns. The parser
+    # emits the new *_doc names; legacy raw_* names are accepted as a fallback.
+    name = ln.get("raw_name", "") or ""
+    return {
+        "raw_name": name,
+        "raw_supplier_code": ln.get("raw_supplier_code", "") or "",
+        "qty_doc": _df(ln, "qty_doc", "raw_qty"),
+        "unit_doc": _df(ln, "unit_doc", "raw_unit"),
+        "price_doc_net": _df(ln, "price_doc_net", "raw_unit_price"),
+        "total_doc_net": _df(ln, "total_doc_net", "raw_line_total"),
+        "vat_rate": ln.get("vat_rate", "") or "",
+        "carton_hint": (ln.get("carton_hint") or "").strip() or _carton_from_name(name),
+        "parsed_content": rc.to_float(_df(ln, "unit_content")),
+        "parsed_unit_skl": (ln.get("unit_skl") or "").strip().lower(),
+    }
+
+
+def translate_layer(dl, mem):
+    # The TRANSLATOR layer (the only thing allowed to come from the name/memory):
+    # unit_content = size of ONE document unit in the warehouse base unit; unit_skl
+    # = that base unit; src in {memory, name, column}. Priority: memory > name >
+    # column (unit_doc already a convertible base unit). Undefined -> (None,"","").
+    if mem and mem.get("unit_content"):
+        u = mem.get("unit_skl") or _skl_from_unit(dl["unit_doc"]) or ""
+        return mem["unit_content"], u, "memory"
+    if dl["parsed_content"] and dl["parsed_content"] > 0:
+        u = dl["parsed_unit_skl"]
+        if u not in ("kg", "l", "szt"):
+            u = _skl_from_unit(dl["unit_doc"]) or u or ""
+        return dl["parsed_content"], u, "name"
+    dim, fac = normalize_unit(dl["unit_doc"])
+    if dim is not None and fac is not None:
+        return fac, _BASE_NAME[dim], "column"
+    return None, "", ""
+
+
+def warehouse_layer(dl, content, unit_skl, currency, fx_rate):
+    # The WAREHOUSE layer (only computed, never recognised):
+    #   qty_skl   = qty_doc * unit_content
+    #   price_skl = total_doc_net / qty_skl, else price_doc_net / unit_content
+    # Empty (and unit_flag=True -> "jednostki?") when unit_content is undefined.
+    out = {"unit_content": "", "unit_skl": (unit_skl or ""), "qty_skl": "",
+           "price_skl": "", "unit_flag": True}
+    qd = rc.to_float(dl["qty_doc"])
+    if content is None or content <= 0 or qd is None:
+        return out
+    qskl = qd * content
+    out["unit_content"] = _fmt(content)
+    out["qty_skl"] = _fmt(qskl)
+    out["unit_flag"] = bool(qskl >= 100000)
+    price = None
+    td = rc.to_float(dl["total_doc_net"])
+    pd = rc.to_float(dl["price_doc_net"])
+    if td is not None and qskl > 0:
+        price = td / qskl
+    elif pd is not None:
+        price = pd / content
+    if price is not None and price >= 0:
+        if currency != "PLN" and fx_rate:
+            price = price * fx_rate
+        out["price_skl"] = "%.4f" % price
+    return out
+
+
+def ref_price_for(rec, cat_by_id, mem):
+    # Reference net price per warehouse unit for the cena? control: the bound
+    # ingredient's purchase price from Recv_Catalog, else the SKU memory's
+    # last_price_skl. None when there is no reference to compare against.
+    pid = (rec.get("match_productId") or "").strip()
+    if pid:
+        ref = rc.to_float(cat_by_id.get(pid, {}).get("last_purchase_price"))
+        if ref:
+            return ref
+    if mem and mem.get("last_price_skl"):
+        return mem["last_price_skl"]
+    return None
+
+
+def apply_controls(dl, wh, ref_price):
+    # rachunek? : qty_doc * price_doc_net does not reconcile with total_doc_net.
+    # cena?     : price_skl is outside [ref/2 .. ref*2] of a known reference.
+    flags = {"flag_rachunek": False, "flag_cena": False}
+    qd = rc.to_float(dl["qty_doc"])
+    pd = rc.to_float(dl["price_doc_net"])
+    td = rc.to_float(dl["total_doc_net"])
+    if qd is not None and pd is not None and td is not None:
+        tol = max(rc.RACHUNEK_ABS_PLN, rc.RACHUNEK_REL * abs(td))
+        if abs(qd * pd - td) > tol:
+            flags["flag_rachunek"] = True
+    ps = rc.to_float(wh["price_skl"])
+    if ps is not None and ref_price and ref_price > 0:
+        if ps < ref_price * rc.CENA_LO or ps > ref_price * rc.CENA_HI:
+            flags["flag_cena"] = True
+    return flags
 
 
 # ---------------------------------------------------------------------------
@@ -754,10 +939,13 @@ def main():
         if not fid or fid in known_file_ids:
             continue
         mime = f.get("mimeType", "")
+        name_l = (f.get("name") or "").lower()
         if mime == "application/pdf":
             source = "pdf"
         elif "xml" in mime:
             source = "ksef_xml"
+        elif "csv" in mime or name_l.endswith(".csv"):
+            source = "csv"
         elif mime in IMAGE_MIMES:
             source = "wz_photo"
         else:
@@ -844,6 +1032,10 @@ def main():
     todo = todo[:args.limit]
     rc.log("parse: %d document(s) to process" % len(todo))
 
+    # CSV templates (brief batch2 sec.2.4) - read once; parse_csv reads/appends.
+    csv_templates_ws = rc.open_ws(rc.TAB_CSV_TEMPLATES, rc.CSV_TEMPLATES_HEADERS)
+    _, csv_templates = rc.read_records(csv_templates_ws)
+
     ctx = {
         "known_delivery": known_delivery,
         "existing_line_doc_ids": existing_line_doc_ids,
@@ -852,6 +1044,9 @@ def main():
         "known_sha": known_sha,
         "known_md5": known_md5,
         "force": args.force,
+        "csv_templates_ws": csv_templates_ws,
+        "csv_templates": csv_templates,
+        "csv_supplier_nip": "",
     }
     for d in todo:
         try:
@@ -888,7 +1083,7 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         page_ids = page_ids_of(d)
         if not page_ids:
             raise RuntimeError("no drive_file_id to parse")
-        ext = {"pdf": ".pdf", "ksef_xml": ".xml"}.get(source, ".bin")
+        ext = {"pdf": ".pdf", "ksef_xml": ".xml", "csv": ".csv"}.get(source, ".bin")
         merged = []
         header = None
         first_parsed = None
@@ -922,7 +1117,7 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
             # sniff each page so mixed PDF/photo pages parse correctly.
             psource = _sniff_source(tmp, source) if multipage else source
             try:
-                page_parsed = parse_document(psource, tmp, parse_prompt)
+                page_parsed = parse_document(psource, tmp, parse_prompt, ctx)
             finally:
                 try:
                     os.remove(tmp)
@@ -971,6 +1166,16 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         rc.tg("M12 ingest: dokument %s - %s" % (doc_id, parser_note))
 
     supplier_nip = re.sub(r"\D", "", parsed.get("supplier_nip", ""))
+    # Parties safety net (brief batch2 sec.2.5): the buyer NIP must never be read
+    # as the supplier. If the parser swapped them, drop the buyer NIP/name so the
+    # line is treated as "supplier unknown" rather than "supplier = us".
+    if supplier_nip == rc.BUYER_NIP:
+        rc.log("doc %s: parser put BUYER nip as supplier -> clearing (parties swap)"
+               % doc_id)
+        supplier_nip = ""
+        sn = (parsed.get("supplier_name") or "").lower()
+        if any(k in sn for k in ("moss", "fortbolt", "kawiarnia")):
+            parsed["supplier_name"] = ""
     sup = sup_by_nip.get(supplier_nip)
     supplier_id = (sup.get("supplier_id") if sup else "") or (d.get("supplier_id") or "")
     currency = (parsed.get("currency") or d.get("currency") or "PLN").strip().upper()
@@ -985,7 +1190,7 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
     supplier_ref = supplier_id or norm_name(parsed.get("supplier_name", ""))
     net_total = 0.0
     for ln in lines:
-        lt = rc.to_float(ln.get("raw_line_total"))
+        lt = rc.to_float(_df(ln, "total_doc_net", "raw_line_total"))
         if lt is not None:
             net_total += lt
     dedup_key = delivery_key_for(supplier_ref, parsed.get("doc_number", ""),
@@ -1005,7 +1210,7 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
     if currency != "PLN" and doc_date:
         fx_rate, fx_date = rc.nbp_rate(currency, doc_date)
 
-    # match + normalize
+    # match + normalize (three-layer model, brief batch2 sec.2.1/2.2/2.3)
     catalog = cat_rows
     cat_by_id = {c.get("productId"): c for c in catalog}
 
@@ -1023,29 +1228,31 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
             })
         return json.dumps(out, ensure_ascii=True) if out else ""
 
-    def set_qty(rec, ln, dict_packf, unit_hint):
-        cq, unit, bd, flag = compute_qty(ln, dict_packf, unit_hint)
-        rec["canonical_qty"] = cq
-        rec["canonical_unit"] = unit
-        rec["qty_breakdown"] = bd
-        rec["unit_flag"] = flag
+    # Document layer for every line (istina - only printed columns).
+    dls = [doc_layer(ln) for ln in lines]
 
+    # --- match pass: SKU memory / dictionary first, LLM for the rest ---
     unmatched_for_llm = []
     line_records = []
-    for i, ln in enumerate(lines):
-        dm = dict_match(ln, supplier_id, dict_idx)
-        rec = _base_line(doc_id, i + 1, ln, currency, fx_rate)
-        if dm and dm["match_productId"]:
+    mem_for = {}  # i -> memory entry (translator + price memory) when hit
+    for i, dl in enumerate(dls):
+        rec = _base_line(doc_id, i + 1, dl)
+        dm = dict_match(dl, supplier_id, supplier_nip, dict_idx)
+        if dm:
+            mem_for[i] = dm
+        if dm and dm.get("match_productId"):
             pid = dm["match_productId"]
             rec["match_productId"] = pid
             rec["match_name"] = cat_by_id.get(pid, {}).get("name", "")
             rec["match_confidence"] = "%.2f" % dm["confidence"]
-            rec["match_source"] = "dict"
-            set_qty(rec, ln, dm["pack_factor"],
-                    dm["canonical_unit"] or cat_by_id.get(pid, {}).get("unit", ""))
+            # SKU memory (has supplier_nip-derived translator) shows as "pamiec";
+            # a legacy dictionary hit stays "dict".
+            rec["match_source"] = "memory" if dm.get("unit_content") else "dict"
+            if dm.get("tryb"):
+                rec["resolution_mode"] = dm["tryb"]
             rec["status"] = "matched"
         else:
-            unmatched_for_llm.append((i, ln))
+            unmatched_for_llm.append((i, {"raw_name": dl["raw_name"]}))
         line_records.append(rec)
 
     if unmatched_for_llm:
@@ -1053,22 +1260,18 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         # returned match binds to the exact line it was computed for even if some
         # lines were dict-matched or the model's index drifts (see llm_match_batch).
         matches = llm_match_batch(unmatched_for_llm, catalog, match_prompt)
-        for i, ln in unmatched_for_llm:
+        for i, _ in unmatched_for_llm:
             cands = matches.get(i) or []
             rec = line_records[i]
             primary = cands[0] if cands else None
             conf = primary["confidence"] if primary else 0.0
             pid = primary["productId"] if primary else ""
-            # store alternatives (candidates 2..3) for one-tap swap in the app
             rec["match_alternatives"] = alt_json(cands[1:3])
-            # Bands: >=GREEN auto-accept; [REVIEW,GREEN) suggest + "check";
-            # <REVIEW -> unmatched (drop productId, do not stretch).
             if pid and conf >= REVIEW:
                 rec["match_productId"] = pid
                 rec["match_name"] = cat_by_id.get(pid, {}).get("name", "")
                 rec["match_confidence"] = "%.2f" % conf
                 rec["match_source"] = "llm"
-                set_qty(rec, ln, None, cat_by_id.get(pid, {}).get("unit", ""))
                 rec["status"] = "matched"
                 if conf < GREEN:
                     rec["notes"] = "do sprawdzenia (pewnosc %.2f)" % conf
@@ -1077,26 +1280,45 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
                 rec["match_name"] = ""
                 rec["match_confidence"] = "%.2f" % conf
                 rec["match_source"] = "llm"
-                # still compute qty so the manager sees pack breakdown / flag
-                set_qty(rec, ln, None, "")
                 rec["status"] = "unmatched"
 
-    # price per canonical unit (needs canonical_qty, so after the qty pass)
-    for i, ln in enumerate(lines):
-        set_price(line_records[i], ln, currency, fx_rate)
+    # --- translator + warehouse layers + self-checks, per line ---
+    for i, dl in enumerate(dls):
+        rec = line_records[i]
+        mem = mem_for.get(i)
+        content, unit_skl, src = translate_layer(dl, mem)
+        wh = warehouse_layer(dl, content, unit_skl, currency, fx_rate)
+        rec["unit_content"] = wh["unit_content"]
+        rec["unit_skl"] = wh["unit_skl"]
+        rec["unit_content_src"] = src
+        rec["qty_skl"] = wh["qty_skl"]
+        rec["price_skl"] = wh["price_skl"]
+        rec["carton_hint"] = dl["carton_hint"]
+        # Legacy projection so post.py / older UI keep working unchanged.
+        rec["canonical_qty"] = wh["qty_skl"]
+        rec["canonical_unit"] = wh["unit_skl"]
+        rec["purchase_price_pln"] = wh["price_skl"]
+        rec["unit_flag"] = wh["unit_flag"]
+        flags = apply_controls(dl, wh, ref_price_for(rec, cat_by_id, mem))
+        rec["flag_rachunek"] = flags["flag_rachunek"]
+        rec["flag_cena"] = flags["flag_cena"]
 
     # report
     rc.log("doc %s: supplier=%s nr=%s date=%s cur=%s lines=%d status=%s"
            % (doc_id, supplier_id or parsed.get("supplier_name", ""),
               parsed.get("doc_number", ""), doc_date, currency, len(lines), status))
     for r in line_records:
-        qty = r.get("qty_breakdown") or ("%s %s" % (r.get("canonical_qty", ""), r.get("canonical_unit", "")))
-        price = r.get("purchase_price_pln") or "-"
-        rc.log("  [%s] %s -> %s (%s, conf %s) | qty: %s | cena: %s%s"
+        qskl = ("%s %s" % (r.get("qty_skl", ""), r.get("unit_skl", ""))).strip()
+        price = r.get("price_skl") or "-"
+        marks = "".join([
+            " JEDN?" if rc.is_true(r.get("unit_flag")) else "",
+            " RACHUNEK?" if rc.is_true(r.get("flag_rachunek")) else "",
+            " CENA?" if rc.is_true(r.get("flag_cena")) else "",
+        ])
+        rc.log("  [%s] %s -> %s (%s, conf %s) | qty_doc: %s %s -> skl: %s | cena: %s%s"
                % (r["line_no"], r["raw_name"][:40], r.get("match_name", "") or "?",
                   r.get("match_source", ""), r.get("match_confidence", ""),
-                  qty.strip(), price,
-                  " UNIT_FLAG" if rc.is_true(r.get("unit_flag")) else ""))
+                  r.get("qty_doc", ""), r.get("unit_doc", ""), qskl or "-", price, marks))
 
     if dry:
         rc.log("dry: not writing doc %s (%d lines)" % (doc_id, len(line_records)))
@@ -1151,53 +1373,30 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
             rc.log("doc %s: register/move failed: %s" % (doc_id, e))
 
 
-def _base_line(doc_id, line_no, ln, currency, fx_rate):
-    # Price is computed later by set_price (needs canonical_qty). Empty here.
+def _base_line(doc_id, line_no, dl):
+    # One Recv_Lines record seeded with the DOCUMENT layer (brief batch2 sec.2.1).
+    # New *_doc columns are the truth; legacy raw_* columns are mirrored from them
+    # so older code paths and the delivery-dedup net_total keep working.
     return {
         "line_id": str(uuid.uuid4()),
         "doc_id": doc_id,
         "line_no": line_no,
-        "raw_name": ln.get("raw_name", ""),
-        "raw_supplier_code": ln.get("raw_supplier_code", ""),
-        "raw_qty": ln.get("raw_qty", ""),
-        "raw_unit": ln.get("raw_unit", ""),
-        "raw_unit_price": ln.get("raw_unit_price", ""),
-        "raw_line_total": ln.get("raw_line_total", ""),
-        "vat_rate": ln.get("vat_rate", ""),
+        "raw_name": dl["raw_name"],
+        "raw_supplier_code": dl["raw_supplier_code"],
+        # document layer (new)
+        "qty_doc": dl["qty_doc"],
+        "unit_doc": dl["unit_doc"],
+        "price_doc_net": dl["price_doc_net"],
+        "total_doc_net": dl["total_doc_net"],
+        # legacy mirror (kept in sync with the document layer)
+        "raw_qty": dl["qty_doc"],
+        "raw_unit": dl["unit_doc"],
+        "raw_unit_price": dl["price_doc_net"],
+        "raw_line_total": dl["total_doc_net"],
+        "vat_rate": dl["vat_rate"],
         "purchase_price_pln": "",
         "status": "unmatched",
     }
-
-
-def set_price(rec, ln, currency, fx_rate):
-    # Net purchase price PER WAREHOUSE UNIT (canonical), consistent with the
-    # quantity math. Price is OPTIONAL for a receipt (WZ often has none):
-    #   1) wartosc netto (line total) / canonical_qty   -> best, packaging-safe
-    #   2) (cena jedn. netto x raw_qty) / canonical_qty  -> total via unit price
-    #   3) cena jedn. netto, only if there is no packaging (pack_size empty/1)
-    # If none is reliable -> leave empty (NOT zero) and mark "wpisz cene".
-    cq = rc.to_float(rec.get("canonical_qty"))
-    lt = rc.to_float(ln.get("raw_line_total"))
-    up = rc.to_float(ln.get("raw_unit_price"))
-    rq = rc.to_float(ln.get("raw_qty"))
-    psize = rc.to_float(ln.get("pack_size"))
-
-    price = None
-    if lt is not None and cq and cq > 0:
-        price = lt / cq
-    elif up is not None and rq is not None and cq and cq > 0 and rq > 0:
-        price = (up * rq) / cq
-    elif up is not None and (psize is None or psize == 1):
-        price = up
-
-    if price is None or price < 0:
-        rec["purchase_price_pln"] = ""
-        note = "wpisz cene"
-        rec["notes"] = (rec.get("notes") + " | " + note) if rec.get("notes") else note
-        return
-    if currency != "PLN" and fx_rate:
-        price = price * fx_rate
-    rec["purchase_price_pln"] = "%.4f" % price
 
 
 def _set_doc(docs_ws, doc_headers, d, patch, dry):
