@@ -124,7 +124,13 @@ DRIVE_PROCESSED_SUBFOLDER = "Przetworzone"
 # Epoch-ms tokens are timezone-independent, so the freshness math is safe no
 # matter what timezone the Gateway container runs in.
 CONTROL_HEADERS = ["key", "scan_request", "scan_requested_by",
-                   "scan_done", "updated_at", "note"]
+                   "scan_done", "updated_at", "note",
+                   # batch2 sec.8: "Przygotuj do wysylki" (post --dry) request on
+                   # the SAME single control row. post_dry_request carries a token
+                   # "<doc_id>#<epoch_ms>" so re-requesting the same doc re-fires;
+                   # the trigger mirrors it into post_dry_done when handled.
+                   "post_dry_request", "post_dry_requested_by",
+                   "post_dry_done", "post_dry_note"]
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +724,55 @@ def tg(message):
     if rc != 0:
         log("telegram send failed: " + err[:300])
     return rc == 0
+
+
+def tg_long(message):
+    # Send a possibly long text to Telegram in <=3900-char chunks (Telegram caps a
+    # message at 4096). clean_msg() flattens to one line, so for multi-line dry
+    # summaries we DO NOT clean - we send the raw text split on line boundaries.
+    text = (message or "").strip() or "(pusty komunikat)"
+    text = _ANSI_RE.sub("", text)
+    chunks = []
+    buf = ""
+    for ln in text.splitlines():
+        if len(buf) + len(ln) + 1 > 3900:
+            chunks.append(buf)
+            buf = ""
+        buf += ln + "\n"
+    if buf.strip():
+        chunks.append(buf)
+    ok = True
+    for c in (chunks or [text[:3900]]):
+        cmd = [OPENCLAW_BIN, "message", "send", "--channel", "telegram",
+               "--target", TG_TARGET, "--thread-id", TG_THREAD, "--message", c]
+        r, _out, err = _run(cmd)
+        if r != 0:
+            log("telegram long send failed: " + err[:300])
+            ok = False
+    return ok
+
+
+def tg_document(file_path, caption=""):
+    # Send a file as a Telegram document (sendDocument) via openclaw. Used to
+    # attach the FULL stockup JSON body, which is routinely > 4096 chars (brief
+    # batch2 sec.8). Falls back to inlining the file text via tg_long() if the CLI
+    # build has no --file flag for message send.
+    cmd = [OPENCLAW_BIN, "message", "send", "--channel", "telegram",
+           "--target", TG_TARGET, "--thread-id", TG_THREAD,
+           "--file", file_path]
+    if caption:
+        cmd += ["--message", clean_msg(caption)]
+    r, _out, err = _run(cmd)
+    if r == 0:
+        return True
+    log("telegram document send failed (%s) -> inline fallback" % err[:200])
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            body = f.read()
+        return tg_long((caption + "\n" if caption else "") + body)
+    except Exception as e:
+        log("telegram inline fallback failed: %s" % e)
+        return False
 
 
 # ---------------------------------------------------------------------------

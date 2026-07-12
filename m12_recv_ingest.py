@@ -800,28 +800,33 @@ def _stamp_control(row_num, patch):
         rc.set_cell(ws, rc.CONTROL_HEADERS, row_num, k, v)
 
 
-def claim_scan_request(dry=False):
-    # Read ONLY the single Recv_Control row via one cheap values.get (no heavy
-    # tabs, no metadata). Return the request token to run on, or None when there
-    # is nothing fresh to do. On a live claim we stamp scan_done FIRST so the
-    # next 1-minute tick will not re-run the same request. The idle path (the
-    # common every-minute case) is exactly ONE Sheets read and nothing else.
+def claim_requests(dry=False):
+    # ONE Recv_Control read (brief batch2 sec.8): check BOTH the scan_request and
+    # the post_dry_request keys in a single values.get. Returns
+    # (scan_token, post_dry_doc_id, row_num). The idle every-minute tick is still
+    # exactly one read when neither key is fresh. Scan is claimed here (scan_done
+    # stamped) as before; the post_dry doc is only DETECTED - main() stamps
+    # post_dry_done AFTER the dry preview is actually sent, so a crash re-fires it.
     row, row_num = rc.control_row()
     if not row:
-        return None
+        return None, None, None
+    scan_token = _claim_scan(row, row_num, dry)
+    dry_req = _detect_post_dry(row, row_num, dry)  # (doc_id, token) or None
+    return scan_token, dry_req, row_num
+
+
+def _claim_scan(row, row_num, dry):
     req = str(row.get("scan_request") or "").strip()
     done = str(row.get("scan_done") or "").strip()
     if not req or req == done:
-        return None  # nothing new since we last ran -> one read, done
+        return None
     try:
         req_ms = int(float(req))
     except (TypeError, ValueError):
         req_ms = 0
     now_ms = int(time.time() * 1000)
     if req_ms and (now_ms - req_ms) > SCAN_FRESH_SECONDS * 1000:
-        # Stale request (e.g. the bot was down for a long time): do not surprise
-        # the manager with an old scan. Clear it so we stop re-checking.
-        rc.log("if-requested: request %s is stale (%ds old), ignored"
+        rc.log("if-requested: scan request %s is stale (%ds old), ignored"
                % (req, (now_ms - req_ms) // 1000))
         if not dry:
             _stamp_control(row_num, {"scan_done": req,
@@ -835,6 +840,52 @@ def claim_scan_request(dry=False):
                              "note": "scan started " + now_ts(),
                              "updated_at": now_ts()})
     return req
+
+
+def _detect_post_dry(row, row_num, dry):
+    # post_dry_request token = "<doc_id>#<epoch_ms>". Fresh + not yet done -> return
+    # the doc_id (do NOT stamp done here; main stamps after the dry send succeeds).
+    # A stale request is cleared so we stop re-checking.
+    req = str(row.get("post_dry_request") or "").strip()
+    done = str(row.get("post_dry_done") or "").strip()
+    if not req or req == done:
+        return None
+    doc_id, _, ms_part = req.partition("#")
+    doc_id = doc_id.strip()
+    try:
+        req_ms = int(float(ms_part))
+    except (TypeError, ValueError):
+        req_ms = 0
+    now_ms = int(time.time() * 1000)
+    if req_ms and (now_ms - req_ms) > SCAN_FRESH_SECONDS * 1000:
+        rc.log("if-requested: post_dry request %s is stale, ignored" % req)
+        if not dry:
+            _stamp_control(row_num, {"post_dry_done": req,
+                                     "post_dry_note": "stale request ignored",
+                                     "updated_at": now_ts()})
+        return None
+    if not doc_id:
+        return None
+    return (doc_id, req)
+
+
+def _run_post_dry(doc_id, req_token, row_num, dry):
+    # Send the dry stock-up preview for one doc to Telegram (NEVER live), then mark
+    # post_dry_done so the trigger stops re-firing (brief batch2 sec.8).
+    rc.log("if-requested: post_dry_request -> dry preview for doc %s" % doc_id)
+    if dry:
+        rc.log("if-requested (dry): would send post-dry preview for %s" % doc_id)
+        return
+    try:
+        import m12_recv_post as post
+        res = post.run_dry_to_telegram(doc_id)
+        rc.log("post_dry: doc %s -> %s" % (doc_id, res))
+        _stamp_control(row_num, {"post_dry_done": req_token,
+                                 "post_dry_note": "dry wyslany " + now_ts() + " | " + res,
+                                 "updated_at": now_ts()})
+    except Exception as e:
+        rc.log("post_dry FAILED for %s: %s" % (doc_id, e))
+        rc.tg("M12 dry blad doc %s: %s" % (doc_id, str(e)[:200]))
 
 
 # ---------------------------------------------------------------------------
@@ -867,13 +918,17 @@ def main():
     run_id = uuid.uuid4().hex[:12]
     rc.log("ingest: run_id=%s holds the ingest lock" % run_id)
 
-    # Light trigger for the "Rozpoznaj" button: bail out immediately unless the
-    # app queued a fresh request. Checked BEFORE loading prompts / opening the
-    # data tabs / scanning Drive, so an idle every-minute run costs one tiny read.
+    # Light trigger for the "Rozpoznaj" and "Przygotuj do wysylki" buttons: ONE
+    # Recv_Control read checks BOTH keys (brief batch2 sec.8). A post_dry_request
+    # runs a dry preview to Telegram right here (never live) and does not require a
+    # scan. Checked BEFORE loading prompts / scanning Drive, so an idle every-minute
+    # run costs one tiny read.
     if args.if_requested:
-        token = claim_scan_request(args.dry)
+        token, dry_req, ctrl_row = claim_requests(args.dry)
+        if dry_req:
+            _run_post_dry(dry_req[0], dry_req[1], ctrl_row, args.dry)
         if not token:
-            rc.log("if-requested: no fresh scan request; nothing to do")
+            rc.log("if-requested: no fresh scan request; nothing more to do")
             return 0
         rc.log("if-requested: fresh scan request %s -> running ingest" % token)
 

@@ -312,6 +312,99 @@ def dry_report(doc_id, invoice_number, supplier_id, note,
 
 
 # ---------------------------------------------------------------------------
+# "Przygotuj do wysylki" - dry preview to Telegram (brief batch2 sec.8).
+# Invoked by m12_recv_ingest --if-requested on a post_dry_request. NEVER live.
+# ---------------------------------------------------------------------------
+def _dry_summary_text(doc_id, invoice_number, priced, qtyonly, koszt_rows,
+                      tasks, skipped, notpostable):
+    L = []
+    L.append("M12 - Przygotowanie do wysylki (DRY, nic nie poszlo do Dotypos)")
+    L.append("Dokument: %s" % doc_id)
+    L.append("Faktura/nr: %s" % invoice_number)
+    L.append("")
+    if priced:
+        L.append("Z CENA (updatePurchasePrice=true) - %d poz.:" % len(priced))
+        for it in priced:
+            L.append("  - %s | pid=%s | %s %s | %s PLN"
+                     % ((it.get("_name") or "")[:44], it.get("_productId", ""),
+                        _qfmt(it.get("quantity")), it.get("_unit") or "",
+                        it.get("purchasePrice")))
+    if qtyonly:
+        L.append("BEZ CENY (tylko ilosc) - %d poz.:" % len(qtyonly))
+        for it in qtyonly:
+            L.append("  - %s | pid=%s | %s %s"
+                     % ((it.get("_name") or "")[:44], it.get("_productId", ""),
+                        _qfmt(it.get("quantity")), it.get("_unit") or ""))
+    if koszt_rows:
+        L.append("KOSZT (Recv_Koszt, nie na magazyn) - %d poz.:" % len(koszt_rows))
+        for k in koszt_rows:
+            L.append("  - %s | %s | %s PLN"
+                     % ((k.get("_name") or "")[:44], k.get("category", ""),
+                        k.get("net_pln", "")))
+    if tasks:
+        L.append("ZADANIA (do receptury) - %d:" % len(tasks))
+        for t in tasks:
+            L.append("  - %s" % t.get("note", ""))
+    if notpostable:
+        L.append("NIE do wysylki - %d:" % len(notpostable))
+        for (lno, nm, reason) in notpostable:
+            L.append("  - linia %s: %s -> %s" % (lno, (nm or "")[:40], reason))
+    if skipped:
+        L.append("Pominietych (skip): %d" % skipped)
+    return "\n".join(L)
+
+
+def run_dry_to_telegram(doc_id):
+    # Build the dry stock-up preview for ONE document and send it to Telegram: a
+    # human-readable summary (text, chunked) + the FULL JSON body as an attachment
+    # (sendDocument). Reads Sheets + Dotypos catalog only; writes NOTHING live.
+    doty = rc.Doty()
+    docs_ws = rc.open_ws(rc.TAB_DOCS)
+    lines_ws = rc.open_ws(rc.TAB_LINES)
+    _, doc_rows = rc.read_records(docs_ws)
+    _, line_rows = rc.read_records(lines_ws)
+    doc = next((d for d in doc_rows if (d.get("doc_id") or "") == doc_id), None)
+    if not doc:
+        rc.tg("M12 dry: nie znaleziono dokumentu %s" % doc_id)
+        return "not found"
+    dlines = [l for l in line_rows if (l.get("doc_id") or "") == doc_id
+              and not rc.is_true(l.get("line_deleted"))]
+    for l in dlines:
+        l["_supplier"] = doc.get("supplier_id") or doc.get("supplier_name_raw", "")
+        l["_doc_date"] = doc.get("doc_date", "")
+        l["_ksef_ref"] = doc.get("ksef_faktura_ref", "")
+
+    priced, qtyonly, koszt_rows, tasks, skipped, notpostable = build_items(
+        doty, doc_id, dlines, True)  # dry=True -> no live product creation
+    invoice_number = (doc.get("doc_number") or "").strip() or ("WZ-" + str(doc_id)[:8])
+    note = "M12 recv %s" % doc_id
+
+    summary = _dry_summary_text(doc_id, invoice_number, priced, qtyonly,
+                                koszt_rows, tasks, skipped, notpostable)
+    rc.tg_long(summary)
+
+    payload = {
+        "doc_id": doc_id,
+        "invoiceNumber": invoice_number,
+        "priced": stockup_body(priced, invoice_number, doc.get("supplier_id"), note, True) if priced else None,
+        "qtyonly": stockup_body(qtyonly, invoice_number, doc.get("supplier_id"), note, False) if qtyonly else None,
+        "koszt": [{k: v for k, v in kr.items() if not k.startswith("_")} for kr in koszt_rows],
+        "tasks": tasks,
+    }
+    path = "/tmp/m12_dry_body_%s.json" % str(doc_id)[:8]
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=True)
+        rc.tg_document(path, "M12 - pelne cialo stockup (JSON), dok %s" % str(doc_id)[:8])
+    except Exception as e:
+        rc.log("dry: could not write/send JSON body: %s" % e)
+
+    return ("priced=%d qtyonly=%d koszt=%d task=%d skip=%d notpostable=%d"
+            % (len(priced), len(qtyonly), len(koszt_rows), len(tasks),
+               skipped, len(notpostable)))
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main():
