@@ -140,6 +140,41 @@ def today_str():
     return time.strftime("%Y-%m-%d")
 
 
+# Sheets quota / 429 backoff (brief batch2 sec.7). The bot shares the Sheets quota
+# with the console; a burst can return HTTP 429 (RESOURCE_EXHAUSTED). Instead of a
+# fatal Telegram alert we retry with exponential backoff and only fail (raise) if
+# all attempts are exhausted. Env-tunable.
+SHEETS_RETRY_TRIES = int(os.environ.get("M12_SHEETS_RETRY_TRIES", "3") or "3")
+SHEETS_RETRY_BASE_S = float(os.environ.get("M12_SHEETS_RETRY_BASE_S", "20") or "20")
+
+
+def _is_quota_error(e):
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    if code == 429:
+        return True
+    s = str(e).lower()
+    return ("429" in s or "resource_exhausted" in s or "quota exceeded" in s
+            or "rate limit" in s or "ratelimit" in s or "too many requests" in s)
+
+
+def with_backoff(fn, what="sheets", tries=None, base=None):
+    # Run fn(); on a 429/quota error retry with exponential backoff (e.g. 20/40/80
+    # s). Non-quota errors propagate immediately. Raises the last error only after
+    # all attempts fail (caller decides whether that is fatal).
+    tries = SHEETS_RETRY_TRIES if tries is None else tries
+    delay = SHEETS_RETRY_BASE_S if base is None else base
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if not _is_quota_error(e) or i == tries - 1:
+                raise
+            log("%s 429/quota (try %d/%d) -> backoff %ds: %s"
+                % (what, i + 1, tries, int(delay), str(e)[:140]))
+            time.sleep(delay)
+            delay *= 2
+
+
 # Held for the process lifetime so the OS releases it automatically on exit; kept
 # in a module global so the file object is not garbage-collected mid-run.
 _INGEST_LOCK_FH = None
@@ -315,7 +350,9 @@ def _spreadsheet(sheet_id=RECV_SHEET_ID):
 def _worksheets_map(sh):
     m = _WS_CACHE.get(sh.id)
     if m is None:
-        m = dict((ws.title, ws) for ws in sh.worksheets())  # ONE metadata read
+        # ONE metadata read, with 429 backoff (brief batch2 sec.7).
+        wss = with_backoff(sh.worksheets, what="worksheets meta")
+        m = dict((ws.title, ws) for ws in wss)
         _WS_CACHE[sh.id] = m
     return m
 
@@ -328,14 +365,19 @@ def open_ws(tab, headers=None, sheet_id=RECV_SHEET_ID):
     wsmap = _worksheets_map(sh)
     ws = wsmap.get(tab)
     if ws is None:
-        ws = sh.add_worksheet(title=tab, rows=1000, cols=max(10, len(headers or []) + 2))
+        ws = with_backoff(
+            lambda: sh.add_worksheet(title=tab, rows=1000,
+                                     cols=max(10, len(headers or []) + 2)),
+            what="add_worksheet %s" % tab)
         wsmap[tab] = ws
     if headers:
-        cur = ws.row_values(HEADER_ROW)
+        cur = with_backoff(lambda: ws.row_values(HEADER_ROW), what="header %s" % tab)
         if [h.strip() for h in cur[:len(headers)]] != headers:
             # write column names into row 2 (row 1 stays as a human title/comment)
             end = _col_letter(len(headers))
-            ws.update("A%d:%s%d" % (HEADER_ROW, end, HEADER_ROW), [headers])
+            with_backoff(
+                lambda: ws.update("A%d:%s%d" % (HEADER_ROW, end, HEADER_ROW), [headers]),
+                what="write header %s" % tab)
     return ws
 
 
@@ -347,7 +389,9 @@ def control_row():
     # if the tab is absent/empty/unreadable (the trigger then simply no-ops).
     try:
         sh = _spreadsheet(RECV_SHEET_ID)
-        resp = sh.values_get("%s!A%d:F" % (TAB_CONTROL, HEADER_ROW))
+        resp = with_backoff(
+            lambda: sh.values_get("%s!A%d:J" % (TAB_CONTROL, HEADER_ROW)),
+            what="control read")
     except Exception as e:
         log("control read skipped: %s" % e)
         return None, None
@@ -374,7 +418,7 @@ def _col_letter(n):
 
 def read_records(ws):
     # Return list of dicts using row 2 as headers, data from row 3 down.
-    vals = ws.get_all_values()
+    vals = with_backoff(ws.get_all_values, what="read %s" % getattr(ws, "title", "?"))
     if len(vals) < HEADER_ROW:
         return [], []
     headers = [h.strip() for h in vals[HEADER_ROW - 1]]
@@ -394,8 +438,10 @@ def append_rows(ws, headers, dict_rows):
     matrix = []
     for d in dict_rows:
         matrix.append([_cell(d.get(h, "")) for h in headers])
-    ws.append_rows(matrix, value_input_option="RAW",
-                   table_range="A%d" % HEADER_ROW)
+    with_backoff(
+        lambda: ws.append_rows(matrix, value_input_option="RAW",
+                               table_range="A%d" % HEADER_ROW),
+        what="append %s" % getattr(ws, "title", "?"))
 
 
 def delete_rows_where(ws, headers, column_name, value):
@@ -407,7 +453,7 @@ def delete_rows_where(ws, headers, column_name, value):
     if column_name not in headers:
         return 0
     col = headers.index(column_name)  # 0-based into each row list
-    vals = ws.get_all_values()
+    vals = with_backoff(ws.get_all_values, what="read %s" % getattr(ws, "title", "?"))
     targets = []
     for i in range(HEADER_ROW, len(vals)):  # data starts at 0-based index HEADER_ROW
         row = vals[i]
@@ -423,10 +469,10 @@ def delete_rows_where(ws, headers, column_name, value):
         if r == lo - 1:
             lo = r
         else:
-            ws.delete_rows(lo, hi)
+            with_backoff(lambda a=lo, b=hi: ws.delete_rows(a, b), what="delete rows")
             deleted += hi - lo + 1
             lo = hi = r
-    ws.delete_rows(lo, hi)
+    with_backoff(lambda a=lo, b=hi: ws.delete_rows(a, b), what="delete rows")
     deleted += hi - lo + 1
     return deleted
 
@@ -435,7 +481,8 @@ def set_cell(ws, headers, row_number, column_name, value):
     if column_name not in headers:
         raise RuntimeError("column not found: " + column_name)
     col = headers.index(column_name) + 1
-    ws.update_cell(row_number, col, _cell(value))
+    with_backoff(lambda: ws.update_cell(row_number, col, _cell(value)),
+                 what="set_cell %s" % column_name)
 
 
 def _cell(v):
