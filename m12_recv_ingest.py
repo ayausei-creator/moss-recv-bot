@@ -710,6 +710,16 @@ def doc_layer(ln):
     }
 
 
+# A number immediately followed by a mass/volume unit inside the product name
+# (e.g. "2,5kg", "950 g", "750ml", "1 L"). Signals a packaged good whose size
+# should come from unit_content, NOT from a piece count.
+_NAME_MEASURE_RE = re.compile(r"\d[\d.,]*\s*(kg|dag|g|ml|cl|dl|l)\b", re.I)
+
+
+def _name_has_measure(name):
+    return bool(_NAME_MEASURE_RE.search(name or ""))
+
+
 def translate_layer(dl, mem):
     # The TRANSLATOR layer (the only thing allowed to come from the name/memory):
     # unit_content = size of ONE document unit in the warehouse base unit; unit_skl
@@ -725,6 +735,13 @@ def translate_layer(dl, mem):
         return dl["parsed_content"], u, "name"
     dim, fac = normalize_unit(dl["unit_doc"])
     if dim is not None and fac is not None:
+        # column source (unit_doc already a base unit) is 1:1 - BUT a COUNT unit
+        # (szt/op) on a line whose name carries an unresolved weight/volume token
+        # (e.g. "DEVELEY 2,5kg/1,5kg/6") is an ambiguous package: do NOT invent a
+        # piece count. Leave it undefined -> "jednostki?" for the manager to decide
+        # (brief batch2 sec.10 test A: DEVELEY).
+        if dim == "count" and _name_has_measure(dl["raw_name"]):
+            return None, "", ""
         return fac, _BASE_NAME[dim], "column"
     return None, "", ""
 
