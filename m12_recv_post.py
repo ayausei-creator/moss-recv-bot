@@ -157,12 +157,18 @@ def build_items(doty, doc_id, lines, dry):
             skipped += 1
             continue
         if mode == "expense_direct":
+            # Koszt (brief batch2 sec.3): NEVER goes to a stock-up. It is booked as
+            # an expense in Recv_Koszt. net_pln is the LINE's expense total
+            # (total_doc_net / wartosc netto), not the per-unit price - fall back to
+            # price_skl only if the total is missing.
+            net = (ln.get("total_doc_net") or ln.get("raw_line_total")
+                   or ln.get("price_skl") or ln.get("purchase_price_pln") or "")
             koszt_rows.append({
                 "doc_id": doc_id,
                 "line_id": ln.get("line_id", ""),
                 "supplier": ln.get("_supplier", ""),
                 "category": ln.get("expense_category", ""),
-                "net_pln": ln.get("purchase_price_pln", ""),
+                "net_pln": net,
                 "vat_rate": ln.get("vat_rate", ""),
                 "date": ln.get("_doc_date", ""),
                 "faktura_ref": ln.get("_ksef_ref", ""),
