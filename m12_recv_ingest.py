@@ -373,22 +373,24 @@ def parse_document(source, local_path, prompt, ctx=None):
     if source == "pdf":
         txt = pdf_extract_text(local_path)
         ntxt = len(txt.strip())
-        # A real text layer (native PDF): parse it with the text model. But VALIDATE
-        # the result - a "thin" PDF can clear the byte threshold yet drop the table
-        # columns. If the parsed table is empty/degenerate, fall back to vision
-        # (brief batch3 sec.6). A full-text invoice (75630: 7k chars, clean table)
-        # never triggers the fallback.
+        # A native PDF with a text layer is parsed by the text model, but ONLY if
+        # that parse actually recovered the numeric columns. A "thin" PDF clears the
+        # byte threshold yet drops Ilosc/Cena and the model hallucinates qty=Lp;
+        # such a parse is rejected and we fall back to vision. Every PDF logs the
+        # fullness verdict ("pdf table-check: ...") so the chosen route is always
+        # visible in the live log (brief batch4 sec.2).
         if ntxt >= PDF_TEXT_MIN_CHARS:
             result = rc.infer_text(prompt + "\n\n=== DOCUMENT TEXT ===\n" + txt)
             ok, why = _text_table_ok(result)
+            rc.log("pdf table-check (%d chars): %s -> %s"
+                   % (ntxt, why, "pdf-text" if ok else "VISION FALLBACK"))
             if ok:
                 rc.log("route=pdf-text (%d chars)" % ntxt)
                 return result
-            rc.log("route=vision (pdf-text thin: %s; %d chars -> render page)"
-                   % (why, ntxt))
+            rc.log("route=vision (pdf-text thin: %s)" % why)
         else:
-            rc.log("route=vision (pdf: no usable text layer, %d chars -> render page)"
-                   % ntxt)
+            rc.log("route=vision (pdf: text layer too short, %d chars < %d)"
+                   % (ntxt, PDF_TEXT_MIN_CHARS))
         png = pdf_render_png(local_path)
         if not png:
             raise RuntimeError(
@@ -412,7 +414,7 @@ def _text_table_ok(parsed):
     # that leaves the numeric columns empty -> vision. A full invoice keeps text
     # route. seq_ratio (qty == Lp) only enriches the log reason.
     if not isinstance(parsed, dict):
-        return False, "brak wyniku"
+        return False, "brak wyniku (parse zwrocil nie-obiekt)"
     lines = parsed.get("lines") or []
     n = len(lines)
     if not n:
@@ -429,15 +431,16 @@ def _text_table_ok(parsed):
             seq += 1
     num_ratio = numfull / float(n)
     seq_ratio = seq / float(n)
-    # PRIMARY: numeric columns must be populated on enough lines. This catches the
-    # thin PDF regardless of whether the qty=Lp hallucination is full or partial
-    # (the failing real doc had qty=1..5 on only some lines yet empty prices).
+    lp = " qty=Lp!" if seq_ratio >= rc.PDF_TEXT_LP_SEQ_RATIO else ""
+    metrics = ("num_ratio=%.2f (%d/%d z Ilosc+Cena/Wartosc), seq=%.2f%s"
+               % (num_ratio, numfull, n, seq_ratio, lp))
+    # PRIMARY: numeric columns must be populated on enough lines. Catches the thin
+    # PDF whether the qty=Lp hallucination is full or partial (the failing real doc
+    # had qty=1..5 on only some lines yet empty prices).
     if num_ratio < rc.PDF_TEXT_MIN_NUM_RATIO:
-        extra = " (qty=Lp: halucynacja)" if seq_ratio >= rc.PDF_TEXT_LP_SEQ_RATIO else ""
-        return False, ("kolumny liczbowe (Ilosc+Cena/Wartosc) tylko w %d/%d poz. "
-                       "(%.2f < %.2f)%s"
-                       % (numfull, n, num_ratio, rc.PDF_TEXT_MIN_NUM_RATIO, extra))
-    return True, "ok"
+        return False, ("kolumny liczbowe puste: %s < prog %.2f"
+                       % (metrics, rc.PDF_TEXT_MIN_NUM_RATIO))
+    return True, ("ok: %s" % metrics)
 
 
 def parse_csv(local_path, prompt, ctx):
