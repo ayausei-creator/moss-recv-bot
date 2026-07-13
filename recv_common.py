@@ -73,19 +73,17 @@ RACHUNEK_REL = 0.005
 CENA_LO = 0.5
 CENA_HI = 2.0
 
-# PDF routing sufficiency (brief batch4 sec.3). A native PDF with a text layer is
-# parsed as text ONLY if the parse actually recovered the NUMERIC columns. A
-# "thin" PDF clears the byte threshold yet drops Ilosc/Cena, and the model then
-# HALLUCINATES qty_doc = the line's ordinal (1,2,3,...). We fall back to vision
-# when either signal fires:
-#   * qty_doc == Lp (row index) for most lines AND numeric columns mostly empty
-#     -> hallucination (PDF_TEXT_LP_SEQ_RATIO / PDF_TEXT_MIN_NUM_RATIO);
-#   * an Ilosc value is present in fewer than PDF_TEXT_MIN_QTY_RATIO of lines.
-# A full text invoice (75630) keeps route=pdf-text; a legit price-less WZ (real
-# qty, no prices) is NOT sent to vision (its qty is not sequential and is present).
-PDF_TEXT_MIN_QTY_RATIO = float(os.environ.get("M12_PDF_QTY_RATIO", "0.5") or "0.5")
+# PDF routing sufficiency (brief batch4 sec.3, hardened after real-doc failure).
+# PRIMARY signal = fullness of the NUMERIC columns: a text-route parse is trusted
+# ONLY if at least PDF_TEXT_MIN_NUM_RATIO of lines carry qty_doc AND
+# (price_doc_net OR total_doc_net). A "thin" PDF drops Ilosc/Cena from the text and
+# the model hallucinates qty_doc = the row ordinal (1,2,3,...) with empty prices;
+# a full invoice (75630) has prices on every line and stays route=pdf-text.
+# NOTE: a native, text-layer PDF with NO prices at all also goes to vision (rare;
+# WZ are usually photos, and vision reads the qty fine). PDF_TEXT_LP_SEQ_RATIO only
+# adds a "qty=Lp: halucynacja" note to the log.
 PDF_TEXT_MIN_NUM_RATIO = float(os.environ.get("M12_PDF_NUM_RATIO", "0.5") or "0.5")
-PDF_TEXT_LP_SEQ_RATIO = float(os.environ.get("M12_PDF_LP_SEQ_RATIO", "0.7") or "0.7")
+PDF_TEXT_LP_SEQ_RATIO = float(os.environ.get("M12_PDF_LP_SEQ_RATIO", "0.5") or "0.5")
 
 # Sheet tab names (contract with the manager app, brief sec.4).
 TAB_DOCS = "Recv_Docs"
@@ -399,6 +397,27 @@ def open_ws(tab, headers=None, sheet_id=RECV_SHEET_ID):
                 lambda: ws.update("A%d:%s%d" % (HEADER_ROW, end, HEADER_ROW), [headers]),
                 what="write header %s" % tab)
     return ws
+
+
+def ensure_columns(ws, headers, cols):
+    # Append any of `cols` that are MISSING from the header row (HEADER_ROW=2) to
+    # the END of it, and return the (possibly extended) header list. Append-only:
+    # never reorders or renames existing columns (brief batch4 sec.1.2). The bot
+    # needs this because it opens tabs without a header contract (open_ws(TAB)) and
+    # therefore cannot rely on the console having created a new column yet - e.g.
+    # supplier_nip on Recv_Docs (batch4): without this, _set_doc silently dropped
+    # the write because the column did not exist in the sheet.
+    missing = [c for c in cols if c not in headers]
+    if not missing:
+        return headers
+    new_headers = list(headers) + missing
+    start = _col_letter(len(headers) + 1)
+    end = _col_letter(len(new_headers))
+    rng = "%s%d:%s%d" % (start, HEADER_ROW, end, HEADER_ROW)
+    with_backoff(lambda: ws.update(rng, [missing]),
+                 what="ensure_columns %s" % getattr(ws, "title", "?"))
+    log("ensure_columns: added %s to %s" % (missing, getattr(ws, "title", "?")))
+    return new_headers
 
 
 def control_row():

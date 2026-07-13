@@ -405,41 +405,38 @@ def parse_document(source, local_path, prompt, ctx=None):
 
 def _text_table_ok(parsed):
     # Judge whether a text-route parse actually recovered the NUMERIC columns
-    # (brief batch4 sec.3). Returns (ok, reason). Looks at column FULLNESS, not
-    # table structure:
-    #   * qty present in < PDF_TEXT_MIN_QTY_RATIO of lines -> Ilosc column absent;
-    #   * qty_doc == Lp (row ordinal) for most lines AND (price|total) mostly empty
-    #     -> the model hallucinated qty from the row number (thin PDF, no Ilosc).
-    # A full invoice keeps text route; a legit price-less WZ (real, non-sequential
-    # qty) is NOT flagged.
+    # (brief batch4 sec.3, hardened). Returns (ok, reason). Looks at column
+    # FULLNESS, not table structure: a text parse is trusted only if
+    # >= PDF_TEXT_MIN_NUM_RATIO of lines carry qty_doc AND (price OR total). A thin
+    # PDF drops Ilosc/Cena and the model hallucinates qty_doc = the row ordinal;
+    # that leaves the numeric columns empty -> vision. A full invoice keeps text
+    # route. seq_ratio (qty == Lp) only enriches the log reason.
     if not isinstance(parsed, dict):
         return False, "brak wyniku"
     lines = parsed.get("lines") or []
     n = len(lines)
     if not n:
         return False, "0 pozycji z tekstu"
-    qty_present = 0
-    numfull = 0   # lines with qty AND (price OR total)
-    seq = 0       # lines where qty == 1-based index (Lp)
+    numfull = 0   # lines with qty AND (price OR total) -> a real table row
+    seq = 0       # lines where qty == 1-based index (Lp hallucination tell)
     for i, ln in enumerate(lines):
         qty = rc.to_float(_df(ln, "qty_doc", "raw_qty"))
         price = rc.to_float(_df(ln, "price_doc_net", "raw_unit_price"))
         total = rc.to_float(_df(ln, "total_doc_net", "raw_line_total"))
-        if qty is not None:
-            qty_present += 1
-            if price is not None or total is not None:
-                numfull += 1
-            if abs(qty - (i + 1)) < 1e-9:
-                seq += 1
-    qty_ratio = qty_present / float(n)
+        if qty is not None and (price is not None or total is not None):
+            numfull += 1
+        if qty is not None and abs(qty - (i + 1)) < 1e-9:
+            seq += 1
     num_ratio = numfull / float(n)
     seq_ratio = seq / float(n)
-    if seq_ratio >= rc.PDF_TEXT_LP_SEQ_RATIO and num_ratio < rc.PDF_TEXT_MIN_NUM_RATIO:
-        return False, ("qty=Lp w %d/%d poz. + kolumny liczbowe puste -> halucynacja"
-                       % (seq, n))
-    if qty_ratio < rc.PDF_TEXT_MIN_QTY_RATIO:
-        return False, ("Ilosc obecna tylko w %d/%d poz. (%.2f < %.2f)"
-                       % (qty_present, n, qty_ratio, rc.PDF_TEXT_MIN_QTY_RATIO))
+    # PRIMARY: numeric columns must be populated on enough lines. This catches the
+    # thin PDF regardless of whether the qty=Lp hallucination is full or partial
+    # (the failing real doc had qty=1..5 on only some lines yet empty prices).
+    if num_ratio < rc.PDF_TEXT_MIN_NUM_RATIO:
+        extra = " (qty=Lp: halucynacja)" if seq_ratio >= rc.PDF_TEXT_LP_SEQ_RATIO else ""
+        return False, ("kolumny liczbowe (Ilosc+Cena/Wartosc) tylko w %d/%d poz. "
+                       "(%.2f < %.2f)%s"
+                       % (numfull, n, num_ratio, rc.PDF_TEXT_MIN_NUM_RATIO, extra))
     return True, "ok"
 
 
@@ -1013,6 +1010,13 @@ def main():
     lines_ws = rc.open_ws(rc.TAB_LINES)
     files_ws = rc.open_ws(rc.TAB_FILES, rc.FILES_HEADERS)
     doc_headers, doc_rows = rc.read_records(docs_ws)
+    # batch4 sec.1: the bot opens Recv_Docs without a header contract, so it must
+    # create the columns it writes if the app has not yet. supplier_nip (seller
+    # NIP) is new in batch4; without this the write was silently dropped by
+    # _set_doc. Append-only, at the end. Skipped in --dry (no Sheets writes).
+    if not args.dry:
+        doc_headers = rc.ensure_columns(docs_ws, doc_headers,
+                                        ["claimed_at", "claimed_by", "supplier_nip"])
     line_headers, line_rows = rc.read_records(lines_ws)
     files_headers, file_rows = rc.read_records(files_ws)
     _, dict_rows = rc.read_records(rc.open_ws(rc.TAB_DICT))
@@ -1325,6 +1329,10 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         rc.tg("M12 ingest: dokument %s - %s" % (doc_id, parser_note))
 
     supplier_nip = re.sub(r"\D", "", parsed.get("supplier_nip", ""))
+    # Visible in the log so the owner can confirm the LLM actually returned it
+    # (batch4 sec.1): empty here means the model did not read a seller NIP.
+    rc.log("doc %s: parsed supplier_nip=%r (name=%r)"
+           % (doc_id, supplier_nip, parsed.get("supplier_name", "")))
     # Parties safety net (brief batch2 sec.2.5): the buyer NIP must never be read
     # as the supplier. If the parser swapped them, drop the buyer NIP/name so the
     # line is treated as "supplier unknown" rather than "supplier = us".
