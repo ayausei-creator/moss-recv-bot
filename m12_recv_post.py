@@ -178,6 +178,7 @@ def build_items(doty, doc_id, lines, dry, cat_by_name=None):
     notpostable = []
     cat_by_name = cat_by_name or {}
     created_cache = {}  # normalized new-ingredient name -> productId (this doc)
+    task_seen = set()   # (doc_id, normalized name) -> ONE recipe task (batch5 t6)
     for ln in lines:
         mode = (ln.get("resolution_mode") or "").strip()
         line_no = ln.get("line_no", "")
@@ -230,14 +231,21 @@ def build_items(doty, doc_id, lines, dry, cat_by_name=None):
                     None, None, None, dry)
                 if nkey:
                     created_cache[nkey] = product_id
-            tasks.append({
-                "type": "recipe",
-                "doc_id": doc_id,
-                "line_id": ln.get("line_id", ""),
-                "note": "Nowy skladnik: dodaj do receptury: %s" % new_name,
-                "productId": product_id,
-                "created_at": now_ts(),
-            })
+            # ONE recipe task per (doc, ingredient name) - a collective invoice
+            # repeats the same new ingredient on several lines (batch5 task6).
+            tkey = (doc_id, nkey or _norm_name(new_name))
+            if tkey in task_seen:
+                rc.log("  task dedup: recipe task for '%s' already queued" % new_name)
+            else:
+                task_seen.add(tkey)
+                tasks.append({
+                    "type": "recipe",
+                    "doc_id": doc_id,
+                    "line_id": ln.get("line_id", ""),
+                    "note": "Nowy skladnik: dodaj do receptury: %s" % new_name,
+                    "productId": product_id,
+                    "created_at": now_ts(),
+                })
         elif mode == "create_sku":
             product_id = create_product(
                 doty, ln.get("new_sku_name") or ln.get("raw_name", "New SKU"),
@@ -556,8 +564,18 @@ def main():
         if tasks:
             tws = rc.open_ws(rc.TAB_TASKS,
                              ["type", "doc_id", "line_id", "note", "productId", "created_at"])
-            th, _ = rc.read_records(tws)
-            rc.append_rows(tws, th, tasks)
+            th, trows = rc.read_records(tws)
+            # Sheet-level dedup (batch5 task6): a re-post of the same doc must not
+            # append the same recipe task again.
+            have = set(((r.get("doc_id") or "").strip(), (r.get("note") or "").strip())
+                       for r in trows)
+            fresh_tasks = [t for t in tasks
+                           if (t["doc_id"], t["note"].strip()) not in have]
+            if len(fresh_tasks) < len(tasks):
+                rc.log("doc %s: %d task(s) already in Recv_Tasks -> skipped"
+                       % (doc_id, len(tasks) - len(fresh_tasks)))
+            if fresh_tasks:
+                rc.append_rows(tws, th, fresh_tasks)
 
         # mark posted lines + doc (both priced and qty-only lines are posted)
         posted_ids = set(it["_line_id"] for it in priced) | set(it["_line_id"] for it in qtyonly)
