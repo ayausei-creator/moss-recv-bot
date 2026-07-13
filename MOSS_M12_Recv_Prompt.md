@@ -25,7 +25,7 @@ Output schema:
 
 {
   "supplier_name": "string, as printed (the SELLER / wystawca)",
-  "supplier_nip": "digits only, no spaces or dashes, empty if none",
+  "supplier_nip": "NIP of the SELLER (sprzedawca/wystawca): digits only, no spaces/dashes; NEVER the buyer NIP 5252948161; empty if not printed",
   "doc_number": "invoice / WZ / receipt number as printed",
   "doc_date": "YYYY-MM-DD (issue date). Empty if not readable",
   "currency": "ISO code: PLN, EUR, USD, ... (PLN if a Polish document with zl)",
@@ -72,6 +72,12 @@ Rules:
 - PARTIES: the participant with NIP 5252948161 is ALWAYS the buyer (Kawiarnia
   Moss / Fortbolt). supplier_name / supplier_nip must be the OTHER party
   (sprzedawca / wystawca). Never put the buyer as the supplier.
+  * A document usually prints TWO NIPs. supplier_nip is the one that is NOT
+    5252948161. If the layout has separate "Sprzedawca"/"Wystawca" and
+    "Nabywca"/"Odbiorca" blocks, take supplier_nip from the seller block and
+    ignore the NIP in the buyer block.
+  * If the only NIP you can read is 5252948161, or no seller NIP is printed,
+    leave supplier_nip EMPTY. Do not guess digits.
 - Prices are NET where the document shows both; if only gross is shown, put the
   gross value and leave vat_rate so the human can adjust. Price/total are
   OPTIONAL - a WZ without prices is normal; leave them empty then.

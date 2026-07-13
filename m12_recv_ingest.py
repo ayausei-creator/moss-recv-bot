@@ -404,25 +404,42 @@ def parse_document(source, local_path, prompt, ctx=None):
 
 
 def _text_table_ok(parsed):
-    # Judge whether a text-route parse actually recovered the document table
-    # (brief batch3 sec.6). Returns (ok, reason). Not ok when: no lines at all, or
-    # too small a fraction of lines carry ANY document column (qty/price/total) -
-    # the tell-tale of a PDF whose text layer dropped the columns.
+    # Judge whether a text-route parse actually recovered the NUMERIC columns
+    # (brief batch4 sec.3). Returns (ok, reason). Looks at column FULLNESS, not
+    # table structure:
+    #   * qty present in < PDF_TEXT_MIN_QTY_RATIO of lines -> Ilosc column absent;
+    #   * qty_doc == Lp (row ordinal) for most lines AND (price|total) mostly empty
+    #     -> the model hallucinated qty from the row number (thin PDF, no Ilosc).
+    # A full invoice keeps text route; a legit price-less WZ (real, non-sequential
+    # qty) is NOT flagged.
     if not isinstance(parsed, dict):
         return False, "brak wyniku"
     lines = parsed.get("lines") or []
-    if not lines:
+    n = len(lines)
+    if not n:
         return False, "0 pozycji z tekstu"
-    withcol = 0
-    for ln in lines:
-        if any(str(_df(ln, k1, k2) or "").strip() for (k1, k2) in (
-                ("qty_doc", "raw_qty"), ("price_doc_net", "raw_unit_price"),
-                ("total_doc_net", "raw_line_total"))):
-            withcol += 1
-    ratio = withcol / float(len(lines))
-    if ratio < rc.PDF_TEXT_MIN_TABLE_RATIO:
-        return False, ("kolumny dok. tylko w %d/%d poz. (ratio %.2f < %.2f)"
-                       % (withcol, len(lines), ratio, rc.PDF_TEXT_MIN_TABLE_RATIO))
+    qty_present = 0
+    numfull = 0   # lines with qty AND (price OR total)
+    seq = 0       # lines where qty == 1-based index (Lp)
+    for i, ln in enumerate(lines):
+        qty = rc.to_float(_df(ln, "qty_doc", "raw_qty"))
+        price = rc.to_float(_df(ln, "price_doc_net", "raw_unit_price"))
+        total = rc.to_float(_df(ln, "total_doc_net", "raw_line_total"))
+        if qty is not None:
+            qty_present += 1
+            if price is not None or total is not None:
+                numfull += 1
+            if abs(qty - (i + 1)) < 1e-9:
+                seq += 1
+    qty_ratio = qty_present / float(n)
+    num_ratio = numfull / float(n)
+    seq_ratio = seq / float(n)
+    if seq_ratio >= rc.PDF_TEXT_LP_SEQ_RATIO and num_ratio < rc.PDF_TEXT_MIN_NUM_RATIO:
+        return False, ("qty=Lp w %d/%d poz. + kolumny liczbowe puste -> halucynacja"
+                       % (seq, n))
+    if qty_ratio < rc.PDF_TEXT_MIN_QTY_RATIO:
+        return False, ("Ilosc obecna tylko w %d/%d poz. (%.2f < %.2f)"
+                       % (qty_present, n, qty_ratio, rc.PDF_TEXT_MIN_QTY_RATIO))
     return True, "ok"
 
 
@@ -1485,6 +1502,9 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         "updated_at": now_ts(),
         "supplier_id": supplier_id,
         "supplier_name_raw": parsed.get("supplier_name", ""),
+        # batch4 sec.2: persist the SELLER NIP so the SKU-memory key is complete
+        # (supplier_nip + normalize(name)). Empty when the doc has no seller NIP.
+        "supplier_nip": supplier_nip,
         "doc_number": parsed.get("doc_number", ""),
         "doc_date": doc_date,
         "currency": currency,

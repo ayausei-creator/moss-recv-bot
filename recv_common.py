@@ -73,13 +73,19 @@ RACHUNEK_REL = 0.005
 CENA_LO = 0.5
 CENA_HI = 2.0
 
-# PDF routing sufficiency (brief batch3 sec.6). A native PDF with a text layer is
-# parsed as text ONLY if that text yields a real table - i.e. a large enough
-# fraction of parsed lines carry a document column (qty/price/total). Some "thin"
-# PDFs have a text layer that clears the byte threshold yet drops the table
-# columns (seller + Ilosc/Cena/Wartosc not in the text); those fall back to
-# vision, where the columns are visible on the rendered page.
-PDF_TEXT_MIN_TABLE_RATIO = float(os.environ.get("M12_PDF_TABLE_RATIO", "0.34") or "0.34")
+# PDF routing sufficiency (brief batch4 sec.3). A native PDF with a text layer is
+# parsed as text ONLY if the parse actually recovered the NUMERIC columns. A
+# "thin" PDF clears the byte threshold yet drops Ilosc/Cena, and the model then
+# HALLUCINATES qty_doc = the line's ordinal (1,2,3,...). We fall back to vision
+# when either signal fires:
+#   * qty_doc == Lp (row index) for most lines AND numeric columns mostly empty
+#     -> hallucination (PDF_TEXT_LP_SEQ_RATIO / PDF_TEXT_MIN_NUM_RATIO);
+#   * an Ilosc value is present in fewer than PDF_TEXT_MIN_QTY_RATIO of lines.
+# A full text invoice (75630) keeps route=pdf-text; a legit price-less WZ (real
+# qty, no prices) is NOT sent to vision (its qty is not sequential and is present).
+PDF_TEXT_MIN_QTY_RATIO = float(os.environ.get("M12_PDF_QTY_RATIO", "0.5") or "0.5")
+PDF_TEXT_MIN_NUM_RATIO = float(os.environ.get("M12_PDF_NUM_RATIO", "0.5") or "0.5")
+PDF_TEXT_LP_SEQ_RATIO = float(os.environ.get("M12_PDF_LP_SEQ_RATIO", "0.7") or "0.7")
 
 # Sheet tab names (contract with the manager app, brief sec.4).
 TAB_DOCS = "Recv_Docs"
