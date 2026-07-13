@@ -30,8 +30,10 @@ Output schema:
   "doc_date": "YYYY-MM-DD (issue date). Empty if not readable",
   "currency": "ISO code: PLN, EUR, USD, ... (PLN if a Polish document with zl)",
   "is_foreign": true or false (true if the seller is outside Poland),
+  "doc_total_net": "total NET of the WHOLE document as printed in the summary (Razem netto / Suma netto), dot decimal, empty if the document prints no total",
   "lines": [
     {
+      "lp": "position number (Lp / L.p. / Poz.) exactly as printed in this row; empty if the table has no such column",
       "raw_name": "item name exactly as printed",
       "raw_supplier_code": "supplier article/EAN code if present, else empty",
       "qty_doc": "the number printed in the Ilosc column, dot decimal",
@@ -53,6 +55,14 @@ Rules:
   price_doc_net = Cena jednostkowa netto. total_doc_net = Wartosc netto.
   vat_rate = VAT. Copy them verbatim. Do NOT compute one column from another and
   do NOT use a number from the name as a quantity.
+- lp: copy the PRINTED position number of each row. Never renumber and never
+  invent one when the table has no Lp column - leave it empty then. A collective
+  invoice may legally contain the SAME product with identical quantity and price
+  on TWO different Lp - these are two separate deliveries: output BOTH rows,
+  each with its own printed lp. Do not merge or drop such repeats.
+- doc_total_net: copy the PRINTED total net of the whole document (the summary
+  value "Razem netto" / "Suma netto" / "Wartosc netto razem"). Do not compute it
+  yourself. Empty if the document prints no total.
 - unit_content: fill ONLY when the size of ONE unit is explicitly PRINTED in the
   name, then convert to the warehouse base unit (ml -> l, g -> kg):
     * "...750ml..."     -> unit_content=0.75, unit_skl=l
@@ -86,6 +96,8 @@ Rules:
 - NEVER repeat a line. Each physical position on the document appears EXACTLY
   ONCE in "lines". Do not output the same item twice, and do not restart the
   list from the top. If the document has 11 positions, return exactly 11 objects.
+  (The same item printed on TWO DIFFERENT Lp is NOT a repeat - keep both, see
+  the lp rule above.)
 - Do not invent products, codes, or prices. Empty string when unsure. An empty
   field is always better than a guess.
 - Keep the item name in the original language of the document.

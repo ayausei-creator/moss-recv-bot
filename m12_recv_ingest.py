@@ -102,17 +102,22 @@ def _df(ln, *names):
 def dedup_parsed_lines(lines):
     # Drop positions repeated inside ONE parse (brief item 1). The LLM sometimes
     # emits the same physical line twice (Maracana WZ came back doubled). The key
-    # is the WHOLE printed identity - name + qty + unit + code/EAN + unit price +
-    # line total - so only a byte-for-byte repeat is collapsed. A wholesale doc
-    # that legitimately lists the same product twice with a different price/lot is
-    # kept (dropping it would silently under-receive stock). First wins, order
-    # preserved. Returns (unique_lines, removed_count).
+    # is the WHOLE printed identity - Lp + name + qty + unit + code/EAN + unit
+    # price + line total. batch5 task1: Lp is part of the key because a collective
+    # invoice legally repeats byte-identical positions on DIFFERENT Lp (INTER-MLECZ
+    # 75630: 12 legit repeats were collapsed -> 535.28 net short). Same Lp, or no
+    # Lp extracted (fallback = the old key), still collapses as a true model
+    # repeat. First wins, order preserved. Returns (unique_lines, removed_count).
+    # Known limit: a multi-page doc whose pages restart Lp at 1 could collide two
+    # identical rows across pages - accepted (identical name+qty+price+same Lp).
     seen = set()
     out = []
     removed = 0
     for ln in lines:
         name = norm_name(ln.get("raw_name"))
+        lp = str(ln.get("lp") or "").strip()
         key = "|".join([
+            lp,
             name,
             _num_key(_df(ln, "qty_doc", "raw_qty")),
             (_df(ln, "unit_doc", "raw_unit") or "").strip().lower(),
@@ -125,11 +130,12 @@ def dedup_parsed_lines(lines):
             removed += 1
             # Never collapse a line silently: log the exact repeat we drop so a
             # real under-count (if the key ever proves too loose) is visible.
-            rc.log("dedup: exact repeat collapsed: %r qty=%s unit=%s cena=%s suma=%s"
-                   % (ln.get("raw_name"), _num_key(ln.get("raw_qty")),
-                      (ln.get("raw_unit") or "").strip(),
-                      _num_key(ln.get("raw_unit_price")),
-                      _num_key(ln.get("raw_line_total"))))
+            rc.log("dedup: exact repeat collapsed: lp=%s %r qty=%s unit=%s cena=%s suma=%s"
+                   % (lp or "?", ln.get("raw_name"),
+                      _num_key(_df(ln, "qty_doc", "raw_qty")),
+                      (_df(ln, "unit_doc", "raw_unit") or "").strip(),
+                      _num_key(_df(ln, "price_doc_net", "raw_unit_price")),
+                      _num_key(_df(ln, "total_doc_net", "raw_line_total"))))
             continue
         seen.add(key)
         out.append(ln)
@@ -345,6 +351,7 @@ def parse_ksef_xml(path):
         for child in w.iter():
             row[local(child.tag)] = (child.text or "").strip()
         header["lines"].append({
+            "lp": row.get("NrWierszaFa", ""),
             "raw_name": row.get("P_7", ""),
             "raw_supplier_code": row.get("P_6A", ""),
             "raw_qty": row.get("P_8B", ""),
@@ -362,91 +369,54 @@ PDF_TEXT_MIN_CHARS = int(os.environ.get("M12_PDF_TEXT_MIN_CHARS", "200") or "200
 
 
 def parse_document(source, local_path, prompt, ctx=None):
+    # Returns (parsed_or_None, route_used). Route selection (brief batch5 task4):
+    # BASE choice by file type only - PDF with a text layer -> pdf-text, photo /
+    # scanned PDF (no text layer) -> vision. The batch3/4 "thin text layer"
+    # auto-detect (qty=Lp / num_ratio / seq) is REMOVED; instead the manager can
+    # force a route from the app ("Rozpoznaj ponownie": Tekstowo / Wzrokowo),
+    # which arrives here as ctx["force_route"] in {"pdf-text","vision"}.
+    force = ""
+    if isinstance(ctx, dict):
+        force = (ctx.get("force_route") or "").strip()
     if source in ("image", "wz_photo"):
-        rc.log("route=vision (%s)" % source)
-        return rc.infer_vision(prompt, local_path)
+        if force == "pdf-text":
+            rc.log("route=vision (%s; wymuszony tekstowy niemozliwy dla obrazu)"
+                   % source)
+        else:
+            rc.log("route=vision (%s)" % source)
+        return rc.infer_vision(prompt, local_path), "vision"
     if source == "ksef_xml":
         rc.log("route=ksef-xml")
-        return parse_ksef_xml(local_path)
+        return parse_ksef_xml(local_path), "ksef-xml"
     if source == "csv":
-        return parse_csv(local_path, prompt, ctx)
+        return parse_csv(local_path, prompt, ctx), "csv"
     if source == "pdf":
+        def _pdf_vision(tag):
+            png = pdf_render_png(local_path)
+            if not png:
+                raise RuntimeError(
+                    "PDF bez warstwy tekstowej; brak PyMuPDF/poppler do renderu strony")
+            try:
+                rc.log("route=vision (%s)" % tag)
+                return rc.infer_vision(prompt, png), "vision"
+            finally:
+                try:
+                    os.remove(png)
+                except Exception:
+                    pass
+
+        if force == "vision":
+            return _pdf_vision("wymuszony recznie")
         txt = pdf_extract_text(local_path)
         ntxt = len(txt.strip())
-        # A native PDF with a text layer is parsed by the text model, but ONLY if
-        # that parse actually recovered the numeric columns. A "thin" PDF clears the
-        # byte threshold yet drops Ilosc/Cena and the model hallucinates qty=Lp;
-        # such a parse is rejected and we fall back to vision. Every PDF logs the
-        # fullness verdict ("pdf table-check: ...") so the chosen route is always
-        # visible in the live log (brief batch4 sec.2).
-        if ntxt >= PDF_TEXT_MIN_CHARS:
-            result = rc.infer_text(prompt + "\n\n=== DOCUMENT TEXT ===\n" + txt)
-            ok, why = _text_table_ok(result)
-            rc.log("pdf table-check (%d chars): %s -> %s"
-                   % (ntxt, why, "pdf-text" if ok else "VISION FALLBACK"))
-            if ok:
-                rc.log("route=pdf-text (%d chars)" % ntxt)
-                return result
-            rc.log("route=vision (pdf-text thin: %s)" % why)
-        else:
-            rc.log("route=vision (pdf: text layer too short, %d chars < %d)"
-                   % (ntxt, PDF_TEXT_MIN_CHARS))
-        png = pdf_render_png(local_path)
-        if not png:
-            raise RuntimeError(
-                "PDF bez warstwy tekstowej; brak PyMuPDF/poppler do renderu strony")
-        try:
-            return rc.infer_vision(prompt, png)
-        finally:
-            try:
-                os.remove(png)
-            except Exception:
-                pass
-    return None  # manual / paragon: lines already present
-
-
-def _text_table_ok(parsed):
-    # Judge whether a text-route parse actually recovered the NUMERIC columns
-    # (brief batch4 sec.3, hardened). Returns (ok, reason). Looks at column
-    # FULLNESS, not table structure: a text parse is trusted only if
-    # >= PDF_TEXT_MIN_NUM_RATIO of lines carry qty_doc AND (price OR total). A thin
-    # PDF drops Ilosc/Cena and the model hallucinates qty_doc = the row ordinal;
-    # that leaves the numeric columns empty -> vision. A full invoice keeps text
-    # route. seq_ratio (qty == Lp) only enriches the log reason.
-    if not isinstance(parsed, dict):
-        return False, "brak wyniku (parse zwrocil nie-obiekt)"
-    lines = parsed.get("lines") or []
-    n = len(lines)
-    if not n:
-        return False, "0 pozycji z tekstu"
-    numfull = 0   # lines with qty AND (price OR total) -> a real table row
-    seq = 0       # lines where qty == 1-based index (Lp hallucination tell)
-    for i, ln in enumerate(lines):
-        qty = rc.to_float(_df(ln, "qty_doc", "raw_qty"))
-        price = rc.to_float(_df(ln, "price_doc_net", "raw_unit_price"))
-        total = rc.to_float(_df(ln, "total_doc_net", "raw_line_total"))
-        if qty is not None and (price is not None or total is not None):
-            numfull += 1
-        if qty is not None and abs(qty - (i + 1)) < 1e-9:
-            seq += 1
-    num_ratio = numfull / float(n)
-    seq_ratio = seq / float(n)
-    lp = " qty=Lp!" if seq_ratio >= rc.PDF_TEXT_LP_SEQ_RATIO else ""
-    metrics = ("num_ratio=%.2f (%d/%d z Ilosc+Cena/Wartosc), seq=%.2f%s"
-               % (num_ratio, numfull, n, seq_ratio, lp))
-    # DECISIVE: qty_doc == Lp (row ordinal) for most lines means the Ilosc column
-    # was never recognized and the model is hallucinating (including into Cena, so
-    # num_ratio is NOT trustworthy here - the live thin PDF returned num_ratio=1.00
-    # with seq=0.67). Fall back to vision regardless of num_ratio.
-    if seq_ratio >= rc.PDF_TEXT_LP_SEQ_RATIO:
-        return False, ("qty=Lp (numer wiersza) w wiekszosci poz. -> Ilosc "
-                       "nierozpoznana: %s (prog seq %.2f)"
-                       % (metrics, rc.PDF_TEXT_LP_SEQ_RATIO))
-    # SECONDARY: genuinely empty numeric columns on too many lines.
-    if num_ratio < rc.PDF_TEXT_MIN_NUM_RATIO:
-        return False, ("kolumny liczbowe puste: %s < prog %.2f"
-                       % (metrics, rc.PDF_TEXT_MIN_NUM_RATIO))
-    return True, ("ok: %s" % metrics)
+        if force == "pdf-text" or ntxt >= PDF_TEXT_MIN_CHARS:
+            rc.log("route=pdf-text (%d chars)%s"
+                   % (ntxt, " [wymuszony recznie]" if force == "pdf-text" else ""))
+            return (rc.infer_text(prompt + "\n\n=== DOCUMENT TEXT ===\n" + txt),
+                    "pdf-text")
+        return _pdf_vision("pdf: text layer too short, %d chars < %d"
+                           % (ntxt, PDF_TEXT_MIN_CHARS))
+    return None, ""  # manual / paragon: lines already present
 
 
 def parse_csv(local_path, prompt, ctx):
@@ -569,6 +539,12 @@ def build_dict_index(dict_rows):
             "unit_skl": (r.get("unit_skl") or "").strip(),
             "last_price_skl": rc.to_float(r.get("last_price_skl")),
             "tryb": (r.get("tryb") or "").strip(),
+            # full-decision memory (batch5 task3): the chosen ingredient name for
+            # create_ingredient and the expense category for koszt. Old-format
+            # rows lack these columns -> .get() returns "" and the code degrades
+            # to the previous behavior (no crash).
+            "match_name": (r.get("match_name") or "").strip(),
+            "expense_category": (r.get("expense_category") or "").strip(),
         }
         key = (r.get("key") or "").strip().lower()
         if key:
@@ -596,6 +572,61 @@ def dict_match(line, supplier_id, supplier_nip, dict_idx):
         if k in dict_idx:
             return dict_idx[k]
     return None
+
+
+def build_carry_index(old_rows):
+    # batch5 task3: doc-local carry-over of the manager's decisions across a
+    # re-parse. replace-by-doc_id rewrites the line set, and the standing rule
+    # says manual edits (match_source=manual, resolution_mode, expense_category,
+    # translator) must NOT be lost. The dictionary covers the cross-document
+    # case; this covers THE SAME document: decisions harvested from the rows
+    # about to be replaced, keyed by supplier code and by normalized name.
+    # The fresh DOCUMENT layer always wins for quantities/prices.
+    idx = {}
+    for r in old_rows:
+        entry = {}
+        mode = (r.get("resolution_mode") or "").strip()
+        src = (r.get("match_source") or "").strip().lower()
+        pid = (r.get("match_productId") or "").strip()
+        if mode == "expense_direct" and (r.get("expense_category") or "").strip():
+            entry["mode"] = mode
+            entry["expense_category"] = (r.get("expense_category") or "").strip()
+        elif mode == "create_ingredient":
+            entry["mode"] = mode
+            entry["match_name"] = (r.get("match_name") or "").strip()
+        elif mode == "skip":
+            entry["mode"] = "skip"
+        elif mode in ("bind_ingredient", "bind_sku") and pid and src in ("manual", "confirmed"):
+            entry["mode"] = mode
+            entry["match_productId"] = pid
+            entry["match_name"] = (r.get("match_name") or "").strip()
+            entry["match_source"] = src
+            entry["match_confidence"] = (r.get("match_confidence") or "0.95").strip()
+        # A manually set translator carries regardless of the mode.
+        if (r.get("unit_content_src") or "").strip().lower() == "manual":
+            uc = rc.to_float(r.get("unit_content"))
+            if uc and uc > 0:
+                entry["unit_content"] = uc
+                entry["unit_skl"] = (r.get("unit_skl") or "").strip()
+        if not entry:
+            continue
+        code = (r.get("raw_supplier_code") or "").strip().lower()
+        if code:
+            idx.setdefault("code|" + code, entry)
+        nm = rc.mem_norm_name(r.get("raw_name"))
+        if nm:
+            idx.setdefault("name|" + nm, entry)
+    return idx
+
+
+def carry_for(dl, carry_idx):
+    if not carry_idx:
+        return None
+    code = (dl.get("raw_supplier_code") or "").strip().lower()
+    if code and ("code|" + code) in carry_idx:
+        return carry_idx["code|" + code]
+    nm = rc.mem_norm_name(dl.get("raw_name"))
+    return carry_idx.get("name|" + nm)
 
 
 def _candidates_from_match(m):
@@ -783,7 +814,9 @@ def translate_layer(dl, mem):
     # column (unit_doc already a convertible base unit). Undefined -> (None,"","").
     if mem and mem.get("unit_content"):
         u = mem.get("unit_skl") or _skl_from_unit(dl["unit_doc"]) or ""
-        return mem["unit_content"], u, "memory"
+        # src: "memory" for a dictionary hit; a doc-local carry-over of the
+        # manager's own translator passes src="manual" (batch5 task3).
+        return mem["unit_content"], u, mem.get("src", "memory")
     if dl["parsed_content"] and dl["parsed_content"] > 0:
         u = dl["parsed_unit_skl"]
         if u not in ("kg", "l", "szt"):
@@ -874,18 +907,57 @@ def _stamp_control(row_num, patch):
 
 
 def claim_requests(dry=False):
-    # ONE Recv_Control read (brief batch2 sec.8): check BOTH the scan_request and
-    # the post_dry_request keys in a single values.get. Returns
-    # (scan_token, post_dry_doc_id, row_num). The idle every-minute tick is still
-    # exactly one read when neither key is fresh. Scan is claimed here (scan_done
-    # stamped) as before; the post_dry doc is only DETECTED - main() stamps
-    # post_dry_done AFTER the dry preview is actually sent, so a crash re-fires it.
+    # ONE Recv_Control read: scan_request + post_dry_request + rescan_request
+    # (batch5 task4) checked together. Returns (scan_token, dry_req, rescan_req,
+    # row_num). A fresh rescan takes THIS tick (the run becomes doc-targeted);
+    # a simultaneous scan_request is left UNCLAIMED so the next tick handles it.
+    # post_dry is only detected here - main() stamps post_dry_done after the dry
+    # preview is actually sent, so a crash re-fires it.
     row, row_num = rc.control_row()
     if not row:
-        return None, None, None
-    scan_token = _claim_scan(row, row_num, dry)
+        return None, None, None, None
     dry_req = _detect_post_dry(row, row_num, dry)  # (doc_id, token) or None
-    return scan_token, dry_req, row_num
+    rescan_req = _claim_rescan(row, row_num, dry)  # (doc_id, route) or None
+    scan_token = None if rescan_req else _claim_scan(row, row_num, dry)
+    return scan_token, dry_req, rescan_req, row_num
+
+
+def _claim_rescan(row, row_num, dry):
+    # batch5 task4: "Rozpoznaj ponownie" - re-parse ONE doc with a FORCED route.
+    # Token = "<doc_id>#<pdf-text|vision>#<epoch_ms>". Claimed (rescan_done
+    # stamped) BEFORE the run, scan-style, so a crash cannot re-fire it in a loop;
+    # the result is visible on the doc row itself (route / lines / status).
+    req = str(row.get("rescan_request") or "").strip()
+    done = str(row.get("rescan_done") or "").strip()
+    if not req or req == done:
+        return None
+    parts = req.split("#")
+    doc_id = parts[0].strip() if parts else ""
+    route = parts[1].strip() if len(parts) > 1 else ""
+    ms_part = parts[2] if len(parts) > 2 else ""
+    try:
+        req_ms = int(float(ms_part))
+    except (TypeError, ValueError):
+        req_ms = 0
+    now_ms = int(time.time() * 1000)
+    stale = bool(req_ms and (now_ms - req_ms) > SCAN_FRESH_SECONDS * 1000)
+    bad = (not doc_id) or route not in ("pdf-text", "vision")
+    if stale or bad:
+        rc.log("if-requested: rescan request %r %s, ignored"
+               % (req, "stale" if stale else "invalid"))
+        if not dry:
+            _stamp_control(row_num, {"rescan_done": req,
+                                     "rescan_note": "ignored (stale/invalid)",
+                                     "updated_at": now_ts()})
+        return None
+    if dry:
+        rc.log("if-requested (dry): would claim rescan %s route=%s" % (doc_id, route))
+        return (doc_id, route)
+    _stamp_control(row_num, {"rescan_done": req,
+                             "rescan_note": "rescan started %s route=%s"
+                                            % (now_ts(), route),
+                             "updated_at": now_ts()})
+    return (doc_id, route)
 
 
 def _claim_scan(row, row_num, dry):
@@ -976,6 +1048,9 @@ def main():
     ap.add_argument("--if-requested", action="store_true",
                     help="light trigger (1-min cron): run only when the app set a "
                          "fresh Recv_Control.scan_request; otherwise exit at once")
+    ap.add_argument("--route", default="", choices=["", "pdf-text", "vision"],
+                    help="force the parse route for this run (batch5 task4; "
+                         "used by the app's Rozpoznaj ponownie)")
     args = ap.parse_args()
 
     if args.redo:
@@ -997,13 +1072,22 @@ def main():
     # scan. Checked BEFORE loading prompts / scanning Drive, so an idle every-minute
     # run costs one tiny read.
     if args.if_requested:
-        token, dry_req, ctrl_row = claim_requests(args.dry)
+        token, dry_req, rescan_req, ctrl_row = claim_requests(args.dry)
         if dry_req:
             _run_post_dry(dry_req[0], dry_req[1], ctrl_row, args.dry)
-        if not token:
+        if rescan_req:
+            # batch5 task4: targeted re-parse of ONE doc with a forced route.
+            # A simultaneous scan_request stays unclaimed for the next tick.
+            args.doc = rescan_req[0]
+            args.force = True
+            args.route = rescan_req[1]
+            rc.log("if-requested: rescan doc %s route=%s -> targeted ingest"
+                   % rescan_req)
+        elif not token:
             rc.log("if-requested: no fresh scan request; nothing more to do")
             return 0
-        rc.log("if-requested: fresh scan request %s -> running ingest" % token)
+        else:
+            rc.log("if-requested: fresh scan request %s -> running ingest" % token)
 
     parse_prompt, match_prompt = load_prompts()
     if not parse_prompt:
@@ -1025,7 +1109,9 @@ def main():
     # _set_doc. Append-only, at the end. Skipped in --dry (no Sheets writes).
     if not args.dry:
         doc_headers = rc.ensure_columns(docs_ws, doc_headers,
-                                        ["claimed_at", "claimed_by", "supplier_nip"])
+                                        ["claimed_at", "claimed_by", "supplier_nip",
+                                         "doc_total_net", "flag_suma", "suma_diff",
+                                         "route"])
     line_headers, line_rows = rc.read_records(lines_ws)
     files_headers, file_rows = rc.read_records(files_ws)
     _, dict_rows = rc.read_records(rc.open_ws(rc.TAB_DICT))
@@ -1040,11 +1126,13 @@ def main():
     # count + net total (delivery-dedup fallback when the number is unreadable).
     existing_line_doc_ids = set()
     line_agg = {}  # doc_id -> [count, total_net]
+    old_lines_by_doc = {}  # doc_id -> old rows (carry-over source, batch5 task3)
     for lr in line_rows:
         did = (lr.get("doc_id") or "").strip()
         if not did:
             continue
         existing_line_doc_ids.add(did)
+        old_lines_by_doc.setdefault(did, []).append(lr)
         agg = line_agg.setdefault(did, [0, 0.0])
         agg[0] += 1
         lt = rc.to_float(lr.get("raw_line_total"))
@@ -1203,6 +1291,9 @@ def main():
         "csv_templates": csv_templates,
         "csv_supplier_nip": "",
         "run_id": run_id,
+        # batch5: forced parse route (rescan / --route) + carry-over source rows.
+        "force_route": (args.route or "").strip(),
+        "old_lines_by_doc": old_lines_by_doc,
     }
     for d in todo:
         try:
@@ -1247,6 +1338,7 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
 
     file_meta = []  # per parsed page: {"sha256","md5","fid","filename"}
     parsed = None
+    route_used = ""
     if source in ("manual", "paragon"):
         rc.log("manual/paragon: lines already present, skip parse")
     else:
@@ -1259,6 +1351,8 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         merged = []
         header = None
         first_parsed = None
+        routes = []           # per-page route -> Recv_Docs.route (batch5 task4)
+        total_from_pages = ""  # printed Razem netto may sit on a later page
         multipage = len(page_ids) > 1
         for pno, fid in enumerate(page_ids, start=1):
             tmp = "/tmp/m12_recv_%s_p%d%s" % (doc_id, pno, ext)
@@ -1289,12 +1383,14 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
             # sniff each page so mixed PDF/photo pages parse correctly.
             psource = _sniff_source(tmp, source) if multipage else source
             try:
-                page_parsed = parse_document(psource, tmp, parse_prompt, ctx)
+                page_parsed, page_route = parse_document(psource, tmp, parse_prompt, ctx)
             finally:
                 try:
                     os.remove(tmp)
                 except Exception:
                     pass
+            if page_route:
+                routes.append(page_route)
             if page_parsed is None:
                 continue
             if first_parsed is None:
@@ -1302,6 +1398,10 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
             if header is None and any(page_parsed.get(k) for k in
                                       ("supplier_name", "supplier_nip", "doc_number", "doc_date")):
                 header = dict(page_parsed)
+            if not total_from_pages:
+                tv = str(page_parsed.get("doc_total_net") or "").strip()
+                if tv:
+                    total_from_pages = tv
             pls = page_parsed.get("lines", []) or []
             merged.extend(pls)
             if multipage:
@@ -1311,6 +1411,10 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         # the first page (keeps currency etc. for an otherwise headerless page).
         parsed = header or first_parsed or {}
         parsed["lines"] = merged
+        # The printed document total can live on a non-header page (batch5 task2).
+        if not str(parsed.get("doc_total_net") or "").strip() and total_from_pages:
+            parsed["doc_total_net"] = total_from_pages
+        route_used = "+".join(dict.fromkeys(routes))
 
     if parsed is None:
         # manual/paragon: just move to needs_review
@@ -1407,16 +1511,67 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
     # Document layer for every line (istina - only printed columns).
     dls = [doc_layer(ln) for ln in lines]
 
-    # --- match pass: SKU memory / dictionary first, LLM for the rest ---
+    # --- match pass (batch5 task3): the manager's own doc-local decision
+    # (carry-over) wins, then the SKU memory FULL decision (bind / koszt /
+    # create_ingredient), then the LLM for what is left.
+    carry_idx = build_carry_index(ctx.get("old_lines_by_doc", {}).get(doc_id, []))
     unmatched_for_llm = []
     line_records = []
     mem_for = {}  # i -> memory entry (translator + price memory) when hit
     for i, dl in enumerate(dls):
         rec = _base_line(doc_id, i + 1, dl)
+        cr = carry_for(dl, carry_idx)
         dm = dict_match(dl, supplier_id, supplier_nip, dict_idx)
         if dm:
             mem_for[i] = dm
-        if dm and dm.get("match_productId"):
+        # The manager's own translator from the previous session overrides the
+        # dictionary for the translator layer (shows as "recznie").
+        if cr and cr.get("unit_content"):
+            mem_for[i] = {"unit_content": cr["unit_content"],
+                          "unit_skl": cr.get("unit_skl", ""), "src": "manual"}
+        cmode = (cr or {}).get("mode", "")
+        tryb = (dm.get("tryb") or "").strip() if dm else ""
+        if cmode == "skip":
+            rec["resolution_mode"] = "skip"
+            rec["match_source"] = "manual"
+        elif cmode == "expense_direct":
+            rec["resolution_mode"] = "expense_direct"
+            rec["expense_category"] = cr.get("expense_category", "")
+            rec["match_source"] = "manual"
+            rec["match_confidence"] = "0.95"
+            rec["status"] = "matched"
+        elif cmode == "create_ingredient":
+            rec["resolution_mode"] = "create_ingredient"
+            rec["match_name"] = cr.get("match_name", "")
+            rec["needs_recipe"] = True
+            rec["match_source"] = "manual"
+            rec["match_confidence"] = "0.95"
+            rec["status"] = "matched"
+        elif cmode in ("bind_ingredient", "bind_sku"):
+            pid = cr["match_productId"]
+            rec["resolution_mode"] = cmode
+            rec["match_productId"] = pid
+            rec["match_name"] = cr.get("match_name") or cat_by_id.get(pid, {}).get("name", "")
+            rec["match_source"] = cr.get("match_source", "manual")
+            rec["match_confidence"] = cr.get("match_confidence", "0.95")
+            rec["status"] = "matched"
+        elif dm and tryb == "expense_direct" and dm.get("expense_category"):
+            # memory koszt: full decision, terminal per batch3 rules
+            rec["resolution_mode"] = "expense_direct"
+            rec["expense_category"] = dm["expense_category"]
+            rec["match_source"] = "memory"
+            rec["match_confidence"] = "0.95"
+            rec["status"] = "matched"
+        elif dm and tryb == "create_ingredient" and not (dm.get("match_productId") or "").strip():
+            # memory create_ingredient: name + translator restored; post creates
+            # the product at prowadzenie (batch3 pkg2 approach)
+            rec["resolution_mode"] = "create_ingredient"
+            rec["match_name"] = dm.get("match_name", "")
+            rec["needs_recipe"] = True
+            rec["match_source"] = "memory"
+            rec["match_confidence"] = "0.95"
+            rec["status"] = "matched"
+        elif dm and dm.get("match_productId"):
             pid = dm["match_productId"]
             rec["match_productId"] = pid
             rec["match_name"] = cat_by_id.get(pid, {}).get("name", "")
@@ -1514,6 +1669,24 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
     rc.append_rows(lines_ws, line_headers, line_records)
     ctx["existing_line_doc_ids"].add(doc_id)
 
+    # Document-sum control (batch5 task2): sum of parsed line totals vs the
+    # PRINTED "Razem netto". Advisory only - never blocks Zatwierdz. Skipped when
+    # the document prints no total. net_total is the line-total sum computed
+    # above (all lines incl. koszt; a fresh parse has no deleted lines).
+    doc_total = rc.to_float(parsed.get("doc_total_net"))
+    flag_suma = False
+    suma_diff = ""
+    if doc_total is not None:
+        sdiff = round(net_total - doc_total, 2)
+        if abs(sdiff) > rc.SUMA_TOL_PLN:
+            flag_suma = True
+            suma_diff = "%.2f" % sdiff
+            rc.log("doc %s: suma? lines=%.2f vs Razem netto=%.2f -> diff %.2f"
+                   % (doc_id, net_total, doc_total, sdiff))
+        else:
+            rc.log("doc %s: suma ok (lines=%.2f vs Razem netto=%.2f)"
+                   % (doc_id, net_total, doc_total))
+
     patch = {
         "status": status,
         "updated_at": now_ts(),
@@ -1527,6 +1700,11 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         "currency": currency,
         "is_foreign_wnt": bool(is_foreign),
         "dedup_key": dedup_key,
+        # batch5: printed doc total + suma? control + the route actually used.
+        "doc_total_net": ("%.2f" % doc_total) if doc_total is not None else "",
+        "flag_suma": flag_suma,
+        "suma_diff": suma_diff,
+        "route": route_used,
     }
     if fx_rate is not None:
         patch["fx_rate_to_pln"] = "%.4f" % fx_rate

@@ -73,17 +73,10 @@ RACHUNEK_REL = 0.005
 CENA_LO = 0.5
 CENA_HI = 2.0
 
-# PDF routing sufficiency (brief batch4 sec.3; corrected on the LIVE doc).
-# DECISIVE signal = qty_doc == Lp (row ordinal 1,2,3,...) for a majority of lines.
-# On a thin PDF the model does NOT leave prices empty - it hallucinates numbers
-# into Cena too, so num_ratio came back 1.00 (garbage) and the earlier num_ratio
-# gate never fired. But qty==row-number is an unmistakable tell that the Ilosc
-# column was never recognized. So: seq_ratio >= PDF_TEXT_LP_SEQ_RATIO -> vision,
-# REGARDLESS of num_ratio. PDF_TEXT_MIN_NUM_RATIO stays as a weaker secondary
-# check (genuinely empty numeric columns). A full invoice (75630) has real,
-# non-sequential quantities (seq low) and stays route=pdf-text.
-PDF_TEXT_LP_SEQ_RATIO = float(os.environ.get("M12_PDF_LP_SEQ_RATIO", "0.6") or "0.6")
-PDF_TEXT_MIN_NUM_RATIO = float(os.environ.get("M12_PDF_NUM_RATIO", "0.5") or "0.5")
+# Document-sum control (brief batch5 task2): |sum of line totals - printed
+# "Razem netto"| above this -> flag_suma on Recv_Docs. Advisory only, never
+# blocks Zatwierdz. Control is skipped when the document prints no total.
+SUMA_TOL_PLN = float(os.environ.get("M12_SUMA_TOL", "0.02") or "0.02")
 
 # Sheet tab names (contract with the manager app, brief sec.4).
 TAB_DOCS = "Recv_Docs"
@@ -142,7 +135,12 @@ CONTROL_HEADERS = ["key", "scan_request", "scan_requested_by",
                    # "<doc_id>#<epoch_ms>" so re-requesting the same doc re-fires;
                    # the trigger mirrors it into post_dry_done when handled.
                    "post_dry_request", "post_dry_requested_by",
-                   "post_dry_done", "post_dry_note"]
+                   "post_dry_done", "post_dry_note",
+                   # batch5 task4: "Rozpoznaj ponownie" - re-parse ONE doc with a
+                   # FORCED route. Token "<doc_id>#<pdf-text|vision>#<epoch_ms>";
+                   # the trigger claims it via rescan_done (scan-style).
+                   "rescan_request", "rescan_requested_by",
+                   "rescan_done", "rescan_note"]
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +427,7 @@ def control_row():
     try:
         sh = _spreadsheet(RECV_SHEET_ID)
         resp = with_backoff(
-            lambda: sh.values_get("%s!A%d:J" % (TAB_CONTROL, HEADER_ROW)),
+            lambda: sh.values_get("%s!A%d:N" % (TAB_CONTROL, HEADER_ROW)),
             what="control read")
     except Exception as e:
         log("control read skipped: %s" % e)
