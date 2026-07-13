@@ -138,18 +138,46 @@ def create_product(doty, name, category_id, unit, vat, sale_price, ean, dry):
 # ---------------------------------------------------------------------------
 # build stockup items from a document's confirmed lines
 # ---------------------------------------------------------------------------
-def build_items(doty, doc_id, lines, dry):
+def _norm_name(s):
+    # Normalized ingredient-name key (brief batch3 sec.4): trim, lower, collapse
+    # whitespace. Mirrors recv_common.mem_norm_name / the console's normName.
+    import re as _re
+    return _re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def catalog_name_map():
+    # {normalized_name: productId} from Recv_Catalog, for the create_ingredient
+    # dedup (bind to an existing product instead of creating a duplicate).
+    try:
+        _, rows = rc.read_records(rc.open_ws(rc.TAB_CATALOG))
+    except Exception as e:
+        rc.log("catalog_name_map: read failed (%s); dedup vs catalog disabled" % e)
+        return {}
+    out = {}
+    for r in rows:
+        pid = (r.get("productId") or "").strip()
+        nk = _norm_name(r.get("name"))
+        if pid and nk:
+            out.setdefault(nk, pid)
+    return out
+
+
+def build_items(doty, doc_id, lines, dry, cat_by_name=None):
     # QUANTITY comes first: a line is postable with productId + quantity ALONE.
     # Price is optional. We split postable lines into two groups so we never
     # touch purchase price when it is unknown:
     #   priced   -> stock-up with updatePurchasePrice=true, items carry price
     #   qtyonly  -> stock-up with updatePurchasePrice=false, quantity only
+    # cat_by_name: {normalized_name: productId} of existing catalog products, so a
+    # create_ingredient whose name already exists binds instead of duplicating.
     priced = []
     qtyonly = []
     koszt_rows = []
     tasks = []
     skipped = 0
     notpostable = []
+    cat_by_name = cat_by_name or {}
+    created_cache = {}  # normalized new-ingredient name -> productId (this doc)
     for ln in lines:
         mode = (ln.get("resolution_mode") or "").strip()
         line_no = ln.get("line_no", "")
@@ -178,15 +206,35 @@ def build_items(doty, doc_id, lines, dry):
 
         product_id = (ln.get("match_productId") or "").strip()
         if mode == "create_ingredient":
-            product_id = create_product(
-                doty, ln.get("raw_name", "New ingredient"),
-                rc.CAT_SKLADNIKI, ln.get("canonical_unit", "szt"),
-                None, None, None, dry)
+            # Name = the manager's chosen ingredient name (match_name), NOT the raw
+            # document line. Dedup (brief batch3 sec.4): if the name already exists
+            # in the catalog -> bind to it; if we already created it for an earlier
+            # line of THIS doc -> reuse that id; only otherwise create ONE product.
+            new_name = (ln.get("match_name") or ln.get("new_sku_name")
+                        or ln.get("raw_name") or "New ingredient")
+            nkey = _norm_name(new_name)
+            if product_id:
+                pass  # already carries a productId (e.g. app bound it) -> keep
+            elif nkey and nkey in cat_by_name:
+                product_id = cat_by_name[nkey]
+                rc.log("  create_ingredient '%s' -> existing catalog product %s (no dup)"
+                       % (new_name, product_id))
+            elif nkey and nkey in created_cache:
+                product_id = created_cache[nkey]
+                rc.log("  create_ingredient '%s' -> reuse product %s created this doc"
+                       % (new_name, product_id))
+            else:
+                product_id = create_product(
+                    doty, new_name, rc.CAT_SKLADNIKI,
+                    ln.get("unit_skl") or ln.get("canonical_unit", "szt"),
+                    None, None, None, dry)
+                if nkey:
+                    created_cache[nkey] = product_id
             tasks.append({
                 "type": "recipe",
                 "doc_id": doc_id,
                 "line_id": ln.get("line_id", ""),
-                "note": "Nowy skladnik: dodaj do receptury: %s" % ln.get("raw_name", ""),
+                "note": "Nowy skladnik: dodaj do receptury: %s" % new_name,
                 "productId": product_id,
                 "created_at": now_ts(),
             })
@@ -375,7 +423,7 @@ def run_dry_to_telegram(doc_id):
         l["_ksef_ref"] = doc.get("ksef_faktura_ref", "")
 
     priced, qtyonly, koszt_rows, tasks, skipped, notpostable = build_items(
-        doty, doc_id, dlines, True)  # dry=True -> no live product creation
+        doty, doc_id, dlines, True, catalog_name_map())  # dry -> no live creation
     invoice_number = (doc.get("doc_number") or "").strip() or ("WZ-" + str(doc_id)[:8])
     note = "M12 recv %s" % doc_id
 
@@ -441,6 +489,9 @@ def main():
     approved = approved[:args.limit]
     rc.log("post: %d approved document(s) to process" % len(approved))
 
+    # Catalog name map for create_ingredient dedup (brief batch3 sec.4).
+    cat_by_name = catalog_name_map()
+
     for d in approved:
         doc_id = d.get("doc_id")
         dlines = lines_by_doc.get(doc_id, [])
@@ -451,7 +502,7 @@ def main():
             l["_ksef_ref"] = d.get("ksef_faktura_ref", "")
 
         priced, qtyonly, koszt_rows, tasks, skipped, notpostable = build_items(
-            doty, doc_id, dlines, dry)
+            doty, doc_id, dlines, dry, cat_by_name)
         # invoiceNumber is required and must not be empty; fall back to a ref.
         invoice_number = (d.get("doc_number") or "").strip() or ("WZ-" + str(doc_id)[:8])
         note = "M12 recv %s" % doc_id
