@@ -372,13 +372,23 @@ def parse_document(source, local_path, prompt, ctx=None):
         return parse_csv(local_path, prompt, ctx)
     if source == "pdf":
         txt = pdf_extract_text(local_path)
-        # A real text layer (native PDF): feed the exact text to the text model and
-        # DO NOT rasterize - keeps a perfect table perfect (brief batch2 sec.2.4).
-        if len(txt.strip()) >= PDF_TEXT_MIN_CHARS:
-            rc.log("route=pdf-text (%d chars)" % len(txt.strip()))
-            return rc.infer_text(prompt + "\n\n=== DOCUMENT TEXT ===\n" + txt)
-        rc.log("route=vision (pdf: no usable text layer, %d chars -> render page)"
-               % len(txt.strip()))
+        ntxt = len(txt.strip())
+        # A real text layer (native PDF): parse it with the text model. But VALIDATE
+        # the result - a "thin" PDF can clear the byte threshold yet drop the table
+        # columns. If the parsed table is empty/degenerate, fall back to vision
+        # (brief batch3 sec.6). A full-text invoice (75630: 7k chars, clean table)
+        # never triggers the fallback.
+        if ntxt >= PDF_TEXT_MIN_CHARS:
+            result = rc.infer_text(prompt + "\n\n=== DOCUMENT TEXT ===\n" + txt)
+            ok, why = _text_table_ok(result)
+            if ok:
+                rc.log("route=pdf-text (%d chars)" % ntxt)
+                return result
+            rc.log("route=vision (pdf-text thin: %s; %d chars -> render page)"
+                   % (why, ntxt))
+        else:
+            rc.log("route=vision (pdf: no usable text layer, %d chars -> render page)"
+                   % ntxt)
         png = pdf_render_png(local_path)
         if not png:
             raise RuntimeError(
@@ -391,6 +401,29 @@ def parse_document(source, local_path, prompt, ctx=None):
             except Exception:
                 pass
     return None  # manual / paragon: lines already present
+
+
+def _text_table_ok(parsed):
+    # Judge whether a text-route parse actually recovered the document table
+    # (brief batch3 sec.6). Returns (ok, reason). Not ok when: no lines at all, or
+    # too small a fraction of lines carry ANY document column (qty/price/total) -
+    # the tell-tale of a PDF whose text layer dropped the columns.
+    if not isinstance(parsed, dict):
+        return False, "brak wyniku"
+    lines = parsed.get("lines") or []
+    if not lines:
+        return False, "0 pozycji z tekstu"
+    withcol = 0
+    for ln in lines:
+        if any(str(_df(ln, k1, k2) or "").strip() for (k1, k2) in (
+                ("qty_doc", "raw_qty"), ("price_doc_net", "raw_unit_price"),
+                ("total_doc_net", "raw_line_total"))):
+            withcol += 1
+    ratio = withcol / float(len(lines))
+    if ratio < rc.PDF_TEXT_MIN_TABLE_RATIO:
+        return False, ("kolumny dok. tylko w %d/%d poz. (ratio %.2f < %.2f)"
+                       % (withcol, len(lines), ratio, rc.PDF_TEXT_MIN_TABLE_RATIO))
+    return True, "ok"
 
 
 def parse_csv(local_path, prompt, ctx):

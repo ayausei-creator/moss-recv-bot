@@ -73,6 +73,14 @@ RACHUNEK_REL = 0.005
 CENA_LO = 0.5
 CENA_HI = 2.0
 
+# PDF routing sufficiency (brief batch3 sec.6). A native PDF with a text layer is
+# parsed as text ONLY if that text yields a real table - i.e. a large enough
+# fraction of parsed lines carry a document column (qty/price/total). Some "thin"
+# PDFs have a text layer that clears the byte threshold yet drops the table
+# columns (seller + Ilosc/Cena/Wartosc not in the text); those fall back to
+# vision, where the columns are visible on the rendered page.
+PDF_TEXT_MIN_TABLE_RATIO = float(os.environ.get("M12_PDF_TABLE_RATIO", "0.34") or "0.34")
+
 # Sheet tab names (contract with the manager app, brief sec.4).
 TAB_DOCS = "Recv_Docs"
 TAB_LINES = "Recv_Lines"
@@ -752,24 +760,84 @@ def tg_long(message):
     return ok
 
 
+def _tg_bot_token():
+    # Raw Telegram Bot API token for sendDocument (brief batch3 sec.8). openclaw
+    # 2026.6.5 has no --file for message send, so we call the Bot API directly.
+    # Order: env override, then a few likely secrets files/keys. "" if not found.
+    cand = (os.environ.get("M12_TG_BOT_TOKEN") or "").strip()
+    if cand:
+        return cand
+    for fname in ("telegram.json", "tg.json", "telegram_bot.json", "openclaw.json"):
+        path = os.path.join(SECRETS_DIR, fname)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        for key in ("bot_token", "token", "telegram_bot_token", "tg_bot_token"):
+            v = (data.get(key) if isinstance(data, dict) else None) or ""
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+
+def _multipart_body(fields, file_field, filename, file_bytes, content_type):
+    # Build a minimal multipart/form-data body (no external deps). ASCII boundary.
+    boundary = "----m12recv%d" % (os.getpid())
+    crlf = b"\r\n"
+    out = []
+    for k, v in fields.items():
+        out.append(("--" + boundary).encode())
+        out.append(('Content-Disposition: form-data; name="%s"' % k).encode())
+        out.append(b"")
+        out.append(str(v).encode("utf-8"))
+    out.append(("--" + boundary).encode())
+    out.append(('Content-Disposition: form-data; name="%s"; filename="%s"'
+                % (file_field, filename)).encode())
+    out.append(("Content-Type: %s" % content_type).encode())
+    out.append(b"")
+    out.append(file_bytes)
+    out.append(("--" + boundary + "--").encode())
+    out.append(b"")
+    return crlf.join(out), boundary
+
+
 def tg_document(file_path, caption=""):
-    # Send a file as a Telegram document (sendDocument) via openclaw. Used to
-    # attach the FULL stockup JSON body, which is routinely > 4096 chars (brief
-    # batch2 sec.8). Falls back to inlining the file text via tg_long() if the CLI
-    # build has no --file flag for message send.
-    cmd = [OPENCLAW_BIN, "message", "send", "--channel", "telegram",
-           "--target", TG_TARGET, "--thread-id", TG_THREAD,
-           "--file", file_path]
-    if caption:
-        cmd += ["--message", clean_msg(caption)]
-    r, _out, err = _run(cmd)
-    if r == 0:
-        return True
-    log("telegram document send failed (%s) -> inline fallback" % err[:200])
+    # Attach a file to Telegram as a real document (sendDocument), used for the
+    # FULL stockup JSON body (routinely > 4096 chars). Direct Bot API multipart
+    # when a token is available; otherwise inline fallback via tg_long().
+    token = _tg_bot_token()
+    if token:
+        try:
+            with open(file_path, "rb") as f:
+                blob = f.read()
+            fields = {"chat_id": TG_TARGET}
+            if TG_THREAD:
+                fields["message_thread_id"] = TG_THREAD
+            if caption:
+                fields["caption"] = clean_msg(caption)[:1024]
+            body, boundary = _multipart_body(
+                fields, "document", os.path.basename(file_path), blob,
+                "application/json")
+            url = "https://api.telegram.org/bot%s/sendDocument" % token
+            req = urllib.request.Request(url, data=body, method="POST")
+            req.add_header("Content-Type",
+                           "multipart/form-data; boundary=%s" % boundary)
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                ok = 200 <= resp.status < 300
+            if ok:
+                return True
+            log("telegram sendDocument non-2xx -> inline fallback")
+        except Exception as e:
+            log("telegram sendDocument failed (%s) -> inline fallback" % str(e)[:200])
+    else:
+        log("telegram: no bot token (set M12_TG_BOT_TOKEN) -> inline fallback")
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            body = f.read()
-        return tg_long((caption + "\n" if caption else "") + body)
+            body_txt = f.read()
+        return tg_long((caption + "\n" if caption else "") + body_txt)
     except Exception as e:
         log("telegram inline fallback failed: %s" % e)
         return False
