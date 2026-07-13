@@ -434,9 +434,15 @@ def _text_table_ok(parsed):
     lp = " qty=Lp!" if seq_ratio >= rc.PDF_TEXT_LP_SEQ_RATIO else ""
     metrics = ("num_ratio=%.2f (%d/%d z Ilosc+Cena/Wartosc), seq=%.2f%s"
                % (num_ratio, numfull, n, seq_ratio, lp))
-    # PRIMARY: numeric columns must be populated on enough lines. Catches the thin
-    # PDF whether the qty=Lp hallucination is full or partial (the failing real doc
-    # had qty=1..5 on only some lines yet empty prices).
+    # DECISIVE: qty_doc == Lp (row ordinal) for most lines means the Ilosc column
+    # was never recognized and the model is hallucinating (including into Cena, so
+    # num_ratio is NOT trustworthy here - the live thin PDF returned num_ratio=1.00
+    # with seq=0.67). Fall back to vision regardless of num_ratio.
+    if seq_ratio >= rc.PDF_TEXT_LP_SEQ_RATIO:
+        return False, ("qty=Lp (numer wiersza) w wiekszosci poz. -> Ilosc "
+                       "nierozpoznana: %s (prog seq %.2f)"
+                       % (metrics, rc.PDF_TEXT_LP_SEQ_RATIO))
+    # SECONDARY: genuinely empty numeric columns on too many lines.
     if num_ratio < rc.PDF_TEXT_MIN_NUM_RATIO:
         return False, ("kolumny liczbowe puste: %s < prog %.2f"
                        % (metrics, rc.PDF_TEXT_MIN_NUM_RATIO))

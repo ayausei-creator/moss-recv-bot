@@ -73,17 +73,17 @@ RACHUNEK_REL = 0.005
 CENA_LO = 0.5
 CENA_HI = 2.0
 
-# PDF routing sufficiency (brief batch4 sec.3, hardened after real-doc failure).
-# PRIMARY signal = fullness of the NUMERIC columns: a text-route parse is trusted
-# ONLY if at least PDF_TEXT_MIN_NUM_RATIO of lines carry qty_doc AND
-# (price_doc_net OR total_doc_net). A "thin" PDF drops Ilosc/Cena from the text and
-# the model hallucinates qty_doc = the row ordinal (1,2,3,...) with empty prices;
-# a full invoice (75630) has prices on every line and stays route=pdf-text.
-# NOTE: a native, text-layer PDF with NO prices at all also goes to vision (rare;
-# WZ are usually photos, and vision reads the qty fine). PDF_TEXT_LP_SEQ_RATIO only
-# adds a "qty=Lp: halucynacja" note to the log.
+# PDF routing sufficiency (brief batch4 sec.3; corrected on the LIVE doc).
+# DECISIVE signal = qty_doc == Lp (row ordinal 1,2,3,...) for a majority of lines.
+# On a thin PDF the model does NOT leave prices empty - it hallucinates numbers
+# into Cena too, so num_ratio came back 1.00 (garbage) and the earlier num_ratio
+# gate never fired. But qty==row-number is an unmistakable tell that the Ilosc
+# column was never recognized. So: seq_ratio >= PDF_TEXT_LP_SEQ_RATIO -> vision,
+# REGARDLESS of num_ratio. PDF_TEXT_MIN_NUM_RATIO stays as a weaker secondary
+# check (genuinely empty numeric columns). A full invoice (75630) has real,
+# non-sequential quantities (seq low) and stays route=pdf-text.
+PDF_TEXT_LP_SEQ_RATIO = float(os.environ.get("M12_PDF_LP_SEQ_RATIO", "0.6") or "0.6")
 PDF_TEXT_MIN_NUM_RATIO = float(os.environ.get("M12_PDF_NUM_RATIO", "0.5") or "0.5")
-PDF_TEXT_LP_SEQ_RATIO = float(os.environ.get("M12_PDF_LP_SEQ_RATIO", "0.5") or "0.5")
 
 # Sheet tab names (contract with the manager app, brief sec.4).
 TAB_DOCS = "Recv_Docs"
