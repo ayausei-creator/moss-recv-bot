@@ -131,17 +131,55 @@ def _doty_unit(unit):
     return "Piece"
 
 
+def _vat_multiplier(vat):
+    # Dotypos vat = MULTIPLIER string: 5% -> "1.05", 8% -> "1.08", 23% -> "1.23"
+    # (NOT "5"/"5,0"). Ingredients default to 5% -> "1.05". Accepts a percent
+    # ("5", "23", "8%") or an already-multiplier value ("1.05").
+    v = rc.to_float(str(vat).replace("%", "")) if vat not in (None, "") else None
+    if v is None:
+        return "1.05"
+    if 1.0 <= v < 2.0:
+        return "%.2f" % v
+    return "%.2f" % (1.0 + v / 100.0)
+
+
 def create_product(doty, name, category_id, unit, vat, sale_price, ean, dry):
+    # FULL product body (batch5.2 task2). The minimal name/_categoryId/unit body
+    # was HTTP 400: Dotypos requires points/priceWithoutVat/packaging/deleted etc.
+    # Schema verified LIVE: POST /products with this set returned 201; field
+    # shapes mirror a real product from GET /products (numbers as STRINGS,
+    # booleans as real booleans, unit/unitMeasurement as the Units enum).
+    du = _doty_unit(unit)
     body = {
         "name": name,
-        "_categoryId": category_id,
-        "unit": _doty_unit(unit),
+        "_categoryId": category_id or rc.CAT_SKLADNIKI,
+        "unit": du,
+        "unitMeasurement": du,
+        "vat": _vat_multiplier(vat),
+        "priceWithoutVat": "0",
+        "priceWithVat": "0",
+        "packagingPriceWithVat": "0",
+        "points": "0",
+        "packaging": "1",
+        "packagingMeasurement": "1",
+        "display": False,
+        "onSale": False,
+        "stockDeduct": True,
+        "stockOverdraft": "ALLOW",
+        "discountPercent": "0",
+        "discountPermitted": True,
+        "requiresPriceEntry": False,
+        "flags": "0",
+        "hexColor": "#9E9E9E",
+        "sortOrder": "300000",
+        "deleted": False,
     }
     # sellable SKU fields (only when provided)
-    if vat not in (None, ""):
-        body["vatRate"] = rc.to_float(vat)
     if sale_price not in (None, ""):
-        body["priceWithVat"] = rc.to_float(sale_price)
+        sp = rc.to_float(sale_price)
+        if sp is not None:
+            body["priceWithVat"] = "%g" % sp
+            body["packagingPriceWithVat"] = "%g" % sp
     if ean:
         body["ean"] = ean
     if dry:
@@ -158,6 +196,25 @@ def create_product(doty, name, category_id, unit, vat, sale_price, ean, dry):
         obj = inner[0] if isinstance(inner, list) and inner else data
     pid = str(obj.get("id") or obj.get("_id") or "")
     rc.log("created product %s -> id %s (HTTP %s)" % (name, pid, status))
+    # batch5.2 task2: make the new product bindable IMMEDIATELY - append it to
+    # Recv_Catalog (append-only; the daily catalog cron stays the full sync).
+    # Best-effort: a Sheets hiccup must not fail a product that IS created.
+    if pid:
+        try:
+            cws = rc.open_ws(rc.TAB_CATALOG)
+            ch = rc.with_backoff(lambda: cws.row_values(rc.HEADER_ROW),
+                                 what="catalog header")
+            is_skl = str(category_id or rc.CAT_SKLADNIKI) == rc.CAT_SKLADNIKI
+            rc.append_rows(cws, [h.strip() for h in ch], [{
+                "productId": pid,
+                "name": name,
+                "category": "Skladniki" if is_skl else "",
+                "unit": du,
+                "domain": "kitchen" if is_skl else "shelf",
+            }])
+            rc.log("  catalog: appended new product %s (%s)" % (pid, name))
+        except Exception as e:
+            rc.log("  catalog append failed (%s) - daily catalog cron will pick it up" % e)
     return pid
 
 
@@ -257,6 +314,8 @@ def build_items(doty, doc_id, lines, dry, cat_by_name=None):
                     None, None, None, dry)
                 if nkey:
                     created_cache[nkey] = product_id
+                    # in-memory catalog of THIS run: later docs bind, not duplicate
+                    cat_by_name[nkey] = product_id
             # ONE recipe task per (doc, ingredient name) - a collective invoice
             # repeats the same new ingredient on several lines (batch5 task6).
             tkey = (doc_id, nkey or _norm_name(new_name))
@@ -564,10 +623,21 @@ def main():
                     status, data, hdrs = doty.post(STOCKUPS_PATH, cbody)
                     sid = _extract_id(data, hdrs)
                     if not sid:
-                        # Never lose the stock-up id silently: log what came back
-                        # so the response shape is visible for the next run.
-                        rc.log("doc %s: stock-up id NOT found in response (HTTP %s) raw=%s"
-                               % (doc_id, status, json.dumps(data)[:300]))
+                        # batch5.2 task4: Dotypos answers HTTP 200 with an EMPTY
+                        # body (no echo of the movement id) while the stock-up IS
+                        # created (verified by the POS movement PDF). A 2xx with
+                        # no id is therefore INFO, not a warning; only a non-2xx
+                        # is an error (and that raises in doty.post anyway).
+                        try:
+                            st = int(status or 0)
+                        except (TypeError, ValueError):
+                            st = 0
+                        if 200 <= st < 300:
+                            rc.log("doc %s: stock-up posted, id not echoed by API (HTTP %s)"
+                                   % (doc_id, status))
+                        else:
+                            rc.log("doc %s: stock-up id NOT found in response (HTTP %s) raw=%s"
+                                   % (doc_id, status, json.dumps(data)[:300]))
                     sids.append(sid)
                     rc.log("doc %s: stock-up %s chunk (%d it.) id=%s HTTP %s"
                            % (doc_id, "priced" if with_price else "qtyonly",

@@ -817,6 +817,16 @@ def translate_layer(dl, mem):
         # src: "memory" for a dictionary hit; a doc-local carry-over of the
         # manager's own translator passes src="manual" (batch5 task3).
         return mem["unit_content"], u, mem.get("src", "memory")
+    # batch5.2 task1: when the DOCUMENT unit is already a convertible mass/volume
+    # unit (kg/g/l/ml), the printed quantity IS the warehouse quantity (1:1 after
+    # base conversion). A size token in the name ("ok.8,6 kg/szt") is per-piece
+    # info and must NOT multiply the doc qty (Szynka 51994: 8.458 kg * 8.6 ->
+    # 72.7 kg, ~8.6x stock distortion). The name source stays ONLY for count
+    # units (szt/op), where the per-piece size is exactly what is needed.
+    # Memory/manual above keeps priority over both.
+    ddim, dfac = normalize_unit(dl["unit_doc"])
+    if ddim in ("mass", "vol") and dfac is not None:
+        return dfac, _BASE_NAME[ddim], "column"
     if dl["parsed_content"] and dl["parsed_content"] > 0:
         u = dl["parsed_unit_skl"]
         if u not in ("kg", "l", "szt"):
