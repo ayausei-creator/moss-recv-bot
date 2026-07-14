@@ -409,12 +409,25 @@ def ensure_columns(ws, headers, cols):
     if not missing:
         return headers
     new_headers = list(headers) + missing
+    title = getattr(ws, "title", "?")
+    # batch5.1 task2: writing past the sheet's PHYSICAL grid is a 400 "exceeds
+    # grid limits" (a default tab has 26 columns; Recv_Docs died on AA2:AD2).
+    # Extend the grid FIRST, then write the header cells. Still append-only.
+    try:
+        cur_cols = int(ws.col_count or 0)
+    except Exception:
+        cur_cols = 0
+    if cur_cols and len(new_headers) > cur_cols:
+        add = len(new_headers) - cur_cols
+        with_backoff(lambda: ws.add_cols(add), what="add_cols %s" % title)
+        log("ensure_columns: grid extended %d->%d (%s)"
+            % (cur_cols, len(new_headers), title))
     start = _col_letter(len(headers) + 1)
     end = _col_letter(len(new_headers))
     rng = "%s%d:%s%d" % (start, HEADER_ROW, end, HEADER_ROW)
     with_backoff(lambda: ws.update(rng, [missing]),
-                 what="ensure_columns %s" % getattr(ws, "title", "?"))
-    log("ensure_columns: added %s to %s" % (missing, getattr(ws, "title", "?")))
+                 what="ensure_columns %s" % title)
+    log("ensure_columns: added %s to %s" % (missing, title))
     return new_headers
 
 

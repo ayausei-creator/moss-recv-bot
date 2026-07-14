@@ -105,11 +105,37 @@ def _extract_id(data, hdrs=None):
 # ---------------------------------------------------------------------------
 # product creation (schema VERIFY before live). Returns new productId or None.
 # ---------------------------------------------------------------------------
+# Dotypos expects the Units ENUM, not a raw string ("kg" -> HTTP 400 and the
+# live post died BEFORE the stockup; batch5.1 task1). Case-insensitive, dots
+# and spaces stripped. Enum names map to themselves (canonical_unit can carry
+# a catalog value like "Kilogram" - the fallback must NOT turn it into Piece).
+# Unknown -> Piece + log, so an unmapped unit is visible, not fatal.
+UNIT_MAP = {
+    "kg": "Kilogram", "kilogram": "Kilogram",
+    "g": "Gram", "gram": "Gram",
+    "l": "Liter", "liter": "Liter", "litr": "Liter",
+    "ml": "Milliliter", "milliliter": "Milliliter",
+    "szt": "Piece", "piece": "Piece", "op": "Piece",
+}
+
+
+def _doty_unit(unit):
+    import re as _re
+    key = _re.sub(r"[.\s]+", "", (unit or "").strip().lower())
+    if not key:
+        return "Piece"
+    mapped = UNIT_MAP.get(key)
+    if mapped:
+        return mapped
+    rc.log("  unit '%s' unknown -> Piece" % unit)
+    return "Piece"
+
+
 def create_product(doty, name, category_id, unit, vat, sale_price, ean, dry):
     body = {
         "name": name,
         "_categoryId": category_id,
-        "unit": unit or "szt",
+        "unit": _doty_unit(unit),
     }
     # sellable SKU fields (only when provided)
     if vat not in (None, ""):
