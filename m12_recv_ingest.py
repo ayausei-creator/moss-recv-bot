@@ -72,6 +72,32 @@ def norm_name(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+# faza1 task1: document-kind vocabulary written to Recv_Docs.doc_kind. The
+# parser (LLM / ksef) emits a raw kind; this normalizes it. Anything the parser
+# could not read -> "?" (the manager fixes it in the app; process_doc never
+# overwrites a manual value with "?").
+DOC_KINDS = ("faktura", "wz", "paragon", "inny")
+
+
+def classify_doc_kind(raw):
+    # Map the parser's raw doc_kind (or a printed title fragment) onto the fixed
+    # vocabulary. Keyword rules per the faza1 brief: "Faktura"/"Faktura VAT" ->
+    # faktura; "WZ"/"Wydanie z magazynu" -> wz; "Paragon" -> paragon; a readable
+    # OTHER type -> inny; unreadable/empty -> "?".
+    s = str(raw or "").strip().lower()
+    if not s:
+        return "?"
+    if s in DOC_KINDS:
+        return s
+    if "paragon" in s:
+        return "paragon"
+    if "faktura" in s or "invoice" in s or s in ("fv", "fa"):
+        return "faktura"
+    if s == "wz" or s.startswith("wz ") or "wydanie" in s or "dowod wydania" in s:
+        return "wz"
+    return "?"
+
+
 def page_ids_of(d):
     # Files that make up one document. A multi-page upload (brief item 5/6) sets
     # page_file_ids = comma-separated Drive ids (first == primary drive_file_id).
@@ -344,6 +370,10 @@ def parse_ksef_xml(path):
         "doc_date": first_text("P_1")[:10],
         "currency": first_text("KodWaluty") or "PLN",
         "is_foreign": (first_text("KodWaluty") or "PLN") != "PLN",
+        # faza1 task1: a KSeF file IS an invoice by definition - deterministic.
+        "doc_kind": "faktura",
+        # faza1 task2: P_15 = kwota naleznosci ogolem (gross "Do zaplaty").
+        "doc_total_gross": first_text("P_15"),
         "lines": [],
     }
     for w in idx.get("FaWiersz", []):
@@ -1121,7 +1151,11 @@ def main():
         doc_headers = rc.ensure_columns(docs_ws, doc_headers,
                                         ["claimed_at", "claimed_by", "supplier_nip",
                                          "doc_total_net", "flag_suma", "suma_diff",
-                                         "route"])
+                                         "route",
+                                         # faza1: same relative order as the
+                                         # console's DOCS_HEADERS (lib/schema.ts)
+                                         "doc_kind", "doc_total_gross",
+                                         "dup_override"])
     line_headers, line_rows = rc.read_records(lines_ws)
     files_headers, file_rows = rc.read_records(files_ws)
     _, dict_rows = rc.read_records(rc.open_ws(rc.TAB_DICT))
@@ -1363,6 +1397,8 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         first_parsed = None
         routes = []           # per-page route -> Recv_Docs.route (batch5 task4)
         total_from_pages = ""  # printed Razem netto may sit on a later page
+        gross_from_pages = ""  # faza1 task2: Razem brutto / Do zaplaty too
+        kind_from_pages = ""   # faza1 task1: the title page may not be page 1
         multipage = len(page_ids) > 1
         for pno, fid in enumerate(page_ids, start=1):
             tmp = "/tmp/m12_recv_%s_p%d%s" % (doc_id, pno, ext)
@@ -1412,6 +1448,14 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
                 tv = str(page_parsed.get("doc_total_net") or "").strip()
                 if tv:
                     total_from_pages = tv
+            if not gross_from_pages:
+                gv = str(page_parsed.get("doc_total_gross") or "").strip()
+                if gv:
+                    gross_from_pages = gv
+            if not kind_from_pages:
+                kv = str(page_parsed.get("doc_kind") or "").strip()
+                if kv:
+                    kind_from_pages = kv
             pls = page_parsed.get("lines", []) or []
             merged.extend(pls)
             if multipage:
@@ -1424,11 +1468,19 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         # The printed document total can live on a non-header page (batch5 task2).
         if not str(parsed.get("doc_total_net") or "").strip() and total_from_pages:
             parsed["doc_total_net"] = total_from_pages
+        if not str(parsed.get("doc_total_gross") or "").strip() and gross_from_pages:
+            parsed["doc_total_gross"] = gross_from_pages
+        if not str(parsed.get("doc_kind") or "").strip() and kind_from_pages:
+            parsed["doc_kind"] = kind_from_pages
         route_used = "+".join(dict.fromkeys(routes))
 
     if parsed is None:
-        # manual/paragon: just move to needs_review
-        _set_doc(docs_ws, doc_headers, d, {"status": "needs_review", "updated_at": now_ts()}, dry)
+        # manual/paragon: just move to needs_review. faza1 task1: the kind is
+        # known from the channel itself (no parse to classify from).
+        _set_doc(docs_ws, doc_headers, d,
+                 {"status": "needs_review",
+                  "doc_kind": "paragon" if source == "paragon" else "inny",
+                  "updated_at": now_ts()}, dry)
         return
 
     lines = parsed.get("lines", []) or []
@@ -1466,6 +1518,15 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         sn = (parsed.get("supplier_name") or "").lower()
         if any(k in sn for k in ("moss", "fortbolt", "kawiarnia")):
             parsed["supplier_name"] = ""
+    # faza1 task4: a value already on the row (typed in by the manager, or read
+    # by an earlier parse) survives a re-parse that reads nothing. The parser
+    # only ever IMPROVES the field, never blanks it.
+    if not supplier_nip:
+        prev_nip = re.sub(r"\D", "", d.get("supplier_nip") or "")
+        if prev_nip and prev_nip != rc.BUYER_NIP:
+            supplier_nip = prev_nip
+            rc.log("doc %s: parser read no supplier_nip -> keeping stored %s"
+                   % (doc_id, prev_nip))
     sup = sup_by_nip.get(supplier_nip)
     supplier_id = (sup.get("supplier_id") if sup else "") or (d.get("supplier_id") or "")
     currency = (parsed.get("currency") or d.get("currency") or "PLN").strip().upper()
@@ -1644,10 +1705,29 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         rec["flag_rachunek"] = flags["flag_rachunek"]
         rec["flag_cena"] = flags["flag_cena"]
 
+    # faza1 task1: classify the document kind. A manual fix on the row (or an
+    # earlier good read) is never downgraded to "?" by a re-parse that could
+    # not read the type.
+    doc_kind = classify_doc_kind(parsed.get("doc_kind"))
+    prev_kind = (d.get("doc_kind") or "").strip().lower()
+    if doc_kind == "?" and prev_kind in DOC_KINDS:
+        rc.log("doc %s: parser read no doc_kind -> keeping stored %r"
+               % (doc_id, prev_kind))
+        doc_kind = prev_kind
+
+    # faza1 task2: printed gross total ("Razem brutto" / "Do zaplaty").
+    # Unreadable -> empty, never blocks; an existing row value is kept.
+    doc_gross = rc.to_float(parsed.get("doc_total_gross"))
+    gross_out = ("%.2f" % doc_gross) if doc_gross is not None else ""
+    if not gross_out:
+        gross_out = (d.get("doc_total_gross") or "").strip()
+
     # report
     rc.log("doc %s: supplier=%s nr=%s date=%s cur=%s lines=%d status=%s"
            % (doc_id, supplier_id or parsed.get("supplier_name", ""),
               parsed.get("doc_number", ""), doc_date, currency, len(lines), status))
+    rc.log("doc %s: doc_kind=%s (raw=%r) | doc_total_gross=%s"
+           % (doc_id, doc_kind, parsed.get("doc_kind", ""), gross_out or "-"))
     for r in line_records:
         qskl = ("%s %s" % (r.get("qty_skl", ""), r.get("unit_skl", ""))).strip()
         price = r.get("price_skl") or "-"
@@ -1715,6 +1795,11 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         "flag_suma": flag_suma,
         "suma_diff": suma_diff,
         "route": route_used,
+        # faza1 tasks 1+2: document kind + printed gross ("Do zaplaty"). Both
+        # written on EVERY parse; an unreadable value never wipes what is
+        # already on the row (a manual fix or an earlier good read).
+        "doc_kind": doc_kind,
+        "doc_total_gross": gross_out,
     }
     if fx_rate is not None:
         patch["fx_rate_to_pln"] = "%.4f" % fx_rate

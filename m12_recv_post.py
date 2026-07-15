@@ -26,6 +26,7 @@
 
 import argparse
 import json
+import re
 import sys
 import time
 
@@ -37,6 +38,41 @@ STOCKUPS_PATH = "/warehouses/%s/stockups" % WH
 
 def now_ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
+# faza1 task3: HARD duplicate guard at post time. A document whose
+# (supplier_nip + doc_number) matches an ALREADY POSTED document is not posted
+# again; when the number is unreadable the parse-time dedup_key is the
+# fallback identity. The only way through is the explicit one-shot
+# Recv_Docs.dup_override=TRUE that the console sets on "To osobna dostawa".
+# ---------------------------------------------------------------------------
+def _dup_identity(d):
+    nip = re.sub(r"\D", "", d.get("supplier_nip") or "")
+    num = re.sub(r"\s+", " ", (d.get("doc_number") or "").strip().lower())
+    return nip, num
+
+
+def find_posted_duplicate(d, doc_rows):
+    # First OTHER document with status=posted and the same identity, or None.
+    # Primary key needs BOTH nip and number; with either missing we fall back
+    # to dedup_key (which the ingest only sets when the doc carries enough
+    # identity, so a blank scan can never collide with another blank scan).
+    doc_id = (d.get("doc_id") or "").strip()
+    nip, num = _dup_identity(d)
+    dk = (d.get("dedup_key") or "").strip()
+    for o in doc_rows:
+        oid = (o.get("doc_id") or "").strip()
+        if not oid or oid == doc_id:
+            continue
+        if (o.get("status") or "").strip() != "posted":
+            continue
+        if nip and num:
+            if _dup_identity(o) == (nip, num):
+                return o
+        elif dk and (o.get("dedup_key") or "").strip() == dk:
+            return o
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +558,14 @@ def run_dry_to_telegram(doc_id):
 
     summary = _dry_summary_text(doc_id, invoice_number, priced, qtyonly,
                                 koszt_rows, tasks, skipped, notpostable)
+    # faza1 task3: warn in the Telegram preview when the live post would be
+    # blocked by the hard duplicate guard (same NIP+numer already posted).
+    dup = find_posted_duplicate(doc, doc_rows)
+    if dup and not rc.is_true(doc.get("dup_override")):
+        summary = ("UWAGA: mozliwy duplikat - ten sam NIP+numer juz "
+                   "zaksiegowany (dokument %s). post --live zablokuje bez "
+                   "'To osobna dostawa' (dup_override).\n\n"
+                   % dup.get("doc_id")) + summary
     rc.tg_long(summary)
 
     payload = {
@@ -587,6 +631,34 @@ def main():
 
     for d in approved:
         doc_id = d.get("doc_id")
+
+        # faza1 task3: HARD duplicate guard, checked BEFORE anything with side
+        # effects (create_product runs inside build_items on the live path).
+        # In --dry it only warns, so the preview still shows what WOULD go.
+        dup = find_posted_duplicate(d, doc_rows)
+        if dup:
+            dup_id = dup.get("doc_id")
+            if rc.is_true(d.get("dup_override")):
+                rc.log("doc %s: mozliwy duplikat %s (posted), ale dup_override="
+                       "TRUE ('to osobna dostawa') -> gard ominiety"
+                       % (doc_id, dup_id))
+            elif dry:
+                rc.log("doc %s: UWAGA mozliwy duplikat %s (posted, ten sam "
+                       "NIP+numer) - --live zablokuje bez dup_override"
+                       % (doc_id, dup_id))
+            else:
+                msg = ("mozliwy duplikat: ten sam NIP+numer co dokument %s "
+                       "(posted, stockup %s). Nie zaksiegowano. W konsoli "
+                       "zaznacz 'To osobna dostawa' (dup_override) i powtorz."
+                       % (dup_id, (dup.get("stockup_id") or "").strip() or "-"))
+                rc.log("doc %s: ZABLOKOWANY - %s" % (doc_id, msg))
+                _set_doc(docs_ws, doc_headers, d,
+                         {"error_msg": msg, "updated_at": now_ts()})
+                rc.tg("M12 post: dokument %s NIE zaksiegowany - mozliwy "
+                      "duplikat %s (ten sam NIP+numer, juz posted). Override: "
+                      "'To osobna dostawa' w konsoli." % (doc_id, dup_id))
+                continue
+
         dlines = lines_by_doc.get(doc_id, [])
         # enrich lines with a few doc-level fields for Recv_Koszt
         for l in dlines:
@@ -679,7 +751,10 @@ def main():
             if l.get("line_id") in posted_ids and l.get("_row"):
                 rc.set_cell(lines_ws, line_headers, l["_row"], "status", "posted")
         _set_doc(docs_ws, doc_headers, d,
-                 {"status": "posted", "stockup_id": stockup_id, "updated_at": now_ts()})
+                 {"status": "posted", "stockup_id": stockup_id,
+                  # a stale "mozliwy duplikat" message must not survive a
+                  # successful (overridden) post
+                  "error_msg": "", "updated_at": now_ts()})
         rc.tg("M12 post: dokument %s zaksiegowany (stockup %s; %d z cena, %d bez ceny)"
               % (doc_id, stockup_id, len(priced), len(qtyonly)))
 

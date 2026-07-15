@@ -31,6 +31,8 @@ Output schema:
   "currency": "ISO code: PLN, EUR, USD, ... (PLN if a Polish document with zl)",
   "is_foreign": true or false (true if the seller is outside Poland),
   "doc_total_net": "total NET of the WHOLE document as printed in the summary (Razem netto / Suma netto), dot decimal, empty if the document prints no total",
+  "doc_kind": "type of the document as PRINTED in its title/layout: faktura | wz | paragon | inny; empty if the type is not readable (see rules)",
+  "doc_total_gross": "total GROSS of the WHOLE document as printed in the summary (Razem brutto / Do zaplaty / Suma brutto), dot decimal, empty if the document prints no gross total",
   "lines": [
     {
       "lp": "position number (Lp / L.p. / Poz.) exactly as printed in this row; empty if the table has no such column",
@@ -63,6 +65,18 @@ Rules:
 - doc_total_net: copy the PRINTED total net of the whole document (the summary
   value "Razem netto" / "Suma netto" / "Wartosc netto razem"). Do not compute it
   yourself. Empty if the document prints no total.
+- doc_kind: classify by what the document PRINTS about itself (title, layout):
+    * "Faktura", "Faktura VAT", "Faktura korygujaca/zaliczkowa" -> faktura
+    * "WZ", "Wydanie zewnetrzne", "Wydanie z magazynu", "Dowod wydania" -> wz
+    * "Paragon fiskalny" or a fiscal receipt layout (cash-register footer,
+      NIP kasy, fiscal logo) -> paragon
+    * a readable document of some OTHER type (zamowienie, proforma, oferta,
+      protokol) -> inny
+    * type not readable / not printed -> empty "". Never guess.
+- doc_total_gross: copy the PRINTED gross total of the whole document
+  ("Razem brutto" / "Do zaplaty" / "Suma brutto" / "Razem z VAT"). Do not
+  compute it from net+VAT yourself. Empty if the document prints no gross
+  total (a WZ usually has none - that is normal).
 - unit_content: fill ONLY when the size of ONE unit is explicitly PRINTED in the
   name, then convert to the warehouse base unit (ml -> l, g -> kg):
     * "...750ml..."     -> unit_content=0.75, unit_skl=l
