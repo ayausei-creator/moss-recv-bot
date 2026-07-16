@@ -76,14 +76,16 @@ def norm_name(s):
 # parser (LLM / ksef) emits a raw kind; this normalizes it. Anything the parser
 # could not read -> "?" (the manager fixes it in the app; process_doc never
 # overwrites a manual value with "?").
-DOC_KINDS = ("faktura", "wz", "paragon", "inny")
+DOC_KINDS = ("faktura", "wz", "paragon", "zamowienie", "inny")
 
 
 def classify_doc_kind(raw):
     # Map the parser's raw doc_kind (or a printed title fragment) onto the fixed
     # vocabulary. Keyword rules per the faza1 brief: "Faktura"/"Faktura VAT" ->
-    # faktura; "WZ"/"Wydanie z magazynu" -> wz; "Paragon" -> paragon; a readable
-    # OTHER type -> inny; unreadable/empty -> "?".
+    # faktura; "WZ"/"Wydanie z magazynu" -> wz; "Paragon" -> paragon; faza1.1
+    # task3: "Zamowienie"/"Order" -> zamowienie (an order is NOT a delivery
+    # document and is never postable); a readable OTHER type -> inny;
+    # unreadable/empty -> "?".
     s = str(raw or "").strip().lower()
     if not s:
         return "?"
@@ -95,7 +97,25 @@ def classify_doc_kind(raw):
         return "faktura"
     if s == "wz" or s.startswith("wz ") or "wydanie" in s or "dowod wydania" in s:
         return "wz"
+    # after faktura/wz so "faktura do zamowienia..." still reads as faktura
+    if "zamowienie" in s or "zamowienia" in s or "order" in s:
+        return "zamowienie"
     return "?"
+
+
+def dup_blocks(prev_row, doc_status):
+    # faza1.1 task1: an exact-dup hash entry (Recv_Files) only blocks when the
+    # document that OWNS it is still alive (needs_review/approved/posted/...).
+    # A rejected or duplicate document keeps its hash in the registry as a
+    # trace, but no longer vetoes a re-upload of the same bytes (real case:
+    # rejected sklejka 23a163bc kept blocking the legal KSeF invoice 53194).
+    # A hash row without doc_id never blocks (manual unlink); an owner missing
+    # from Recv_Docs blocks (conservative - we cannot prove it is dead).
+    did = (prev_row.get("doc_id") or "").strip()
+    if not did:
+        return False
+    st = (doc_status or {}).get(did, "")
+    return st not in ("rejected", "duplicate")
 
 
 def page_ids_of(d):
@@ -1155,7 +1175,9 @@ def main():
                                          # faza1: same relative order as the
                                          # console's DOCS_HEADERS (lib/schema.ts)
                                          "doc_kind", "doc_total_gross",
-                                         "dup_override"])
+                                         "dup_override",
+                                         # faza1.1 task2: sklejka? flag
+                                         "flag_sklejka"])
     line_headers, line_rows = rc.read_records(lines_ws)
     files_headers, file_rows = rc.read_records(files_ws)
     _, dict_rows = rc.read_records(rc.open_ws(rc.TAB_DICT))
@@ -1186,6 +1208,14 @@ def main():
     # Exact-file-dup registry (item 2): content hashes of already-parsed files.
     known_md5 = {r.get("md5"): r for r in file_rows if (r.get("md5") or "").strip()}
     known_sha = {r.get("sha256"): r for r in file_rows if (r.get("sha256") or "").strip()}
+
+    # faza1.1 task1: status of every known doc, so the exact-dup guards can tell
+    # a LIVE hash owner from a rejected/duplicate one (dup_blocks above).
+    doc_status = {}
+    for d in doc_rows:
+        did = (d.get("doc_id") or "").strip()
+        if did:
+            doc_status[did] = (d.get("status") or "").strip().lower()
 
     # Every file id already claimed by a doc - INCLUDING extra pages of a
     # multi-page doc - so the scan never re-adds a page as its own document.
@@ -1241,8 +1271,12 @@ def main():
         # Exact-duplicate file (item 2): a byte-identical file already parsed in
         # an earlier run (known_md5) or earlier in this scan (batch_md5). Do NOT
         # create a second document - move the copy out of the inbox, silently.
+        # faza1.1 task1: a hash owned by a rejected/duplicate document does NOT
+        # block - the re-upload becomes a normal new document (dup_blocks).
         md5 = (f.get("md5Checksum") or "").strip()
-        if md5 and (md5 in known_md5 or md5 in batch_md5):
+        prev_file = known_md5.get(md5) if md5 else None
+        if md5 and (md5 in batch_md5
+                    or (prev_file is not None and dup_blocks(prev_file, doc_status))):
             dup_skipped += 1
             rc.log("scan: exact-dup file %s (md5 %s) -> skip, no new doc"
                    % (f.get("name"), md5[:10]))
@@ -1250,6 +1284,12 @@ def main():
                 _move_processed(fid, "DUP_" + _safe_part(f.get("name") or fid, 60))
             known_file_ids.add(fid)
             continue
+        if prev_file is not None:
+            rc.log("scan: file %s (md5 %s) matches doc %s (status %s) -> "
+                   "NOT a dup, parsing anew"
+                   % (f.get("name"), md5[:10],
+                      (prev_file.get("doc_id") or "-"),
+                      doc_status.get((prev_file.get("doc_id") or "").strip(), "?")))
         rec = {
             "doc_id": str(uuid.uuid4()),
             "created_at": now_ts(),
@@ -1330,6 +1370,7 @@ def main():
         "files_headers": files_headers,
         "known_sha": known_sha,
         "known_md5": known_md5,
+        "doc_status": doc_status,
         "force": args.force,
         "csv_templates_ws": csv_templates_ws,
         "csv_templates": csv_templates,
@@ -1383,6 +1424,8 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
     file_meta = []  # per parsed page: {"sha256","md5","fid","filename"}
     parsed = None
     route_used = ""
+    sklejka = False       # faza1.1 task2: pages look like DIFFERENT documents
+    sklejka_msg = ""
     if source in ("manual", "paragon"):
         rc.log("manual/paragon: lines already present, skip parse")
     else:
@@ -1399,6 +1442,7 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         total_from_pages = ""  # printed Razem netto may sit on a later page
         gross_from_pages = ""  # faza1 task2: Razem brutto / Do zaplaty too
         kind_from_pages = ""   # faza1 task1: the title page may not be page 1
+        page_heads = []        # faza1.1 task2: printed header of each page
         multipage = len(page_ids) > 1
         for pno, fid in enumerate(page_ids, start=1):
             tmp = "/tmp/m12_recv_%s_p%d%s" % (doc_id, pno, ext)
@@ -1408,21 +1452,28 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
             # Fallback exact-dup guard for a single bot file whose md5 was not in
             # the Drive metadata at scan time (item 2): a byte-identical file
             # already parsed under another doc -> drop this one silently.
+            # faza1.1 task1: only a LIVE owner blocks; a hash held by a
+            # rejected/duplicate document is a trace, not a veto (dup_blocks).
             prev = ctx["known_sha"].get(sha)
-            if (not multipage and prev
-                    and (prev.get("doc_id") or "") not in ("", doc_id)):
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
-                rc.log("doc %s: exact-dup of %s (sha %s) -> drop, no lines"
-                       % (doc_id, prev.get("doc_id"), sha[:10]))
-                _set_doc(docs_ws, doc_headers, d,
-                         {"status": "duplicate", "updated_at": now_ts(),
-                          "notes": "dokladny duplikat pliku"}, dry)
-                if not dry:
-                    _move_processed(fid, "DUP_" + _safe_part(prev.get("filename") or fid, 60))
-                return
+            prev_owner = (prev.get("doc_id") or "").strip() if prev else ""
+            if not multipage and prev_owner and prev_owner != doc_id:
+                if dup_blocks(prev, ctx.get("doc_status")):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                    rc.log("doc %s: exact-dup of %s (sha %s) -> drop, no lines"
+                           % (doc_id, prev_owner, sha[:10]))
+                    _set_doc(docs_ws, doc_headers, d,
+                             {"status": "duplicate", "updated_at": now_ts(),
+                              "notes": "dokladny duplikat pliku"}, dry)
+                    if not dry:
+                        _move_processed(fid, "DUP_" + _safe_part(prev.get("filename") or fid, 60))
+                    return
+                rc.log("doc %s: sha %s owned by %s (status %s) -> dead doc, "
+                       "NOT a dup, parsing"
+                       % (doc_id, sha[:10], prev_owner,
+                          (ctx.get("doc_status") or {}).get(prev_owner, "?")))
             file_meta.append({"sha256": sha, "md5": md5, "fid": fid,
                               "filename": d.get("_name") or ""})
             # For a single-file doc keep the known source; for a multi-page doc
@@ -1456,11 +1507,48 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
                 kv = str(page_parsed.get("doc_kind") or "").strip()
                 if kv:
                     kind_from_pages = kv
+            if multipage:
+                # faza1.1 task2: remember what THIS page prints about itself.
+                # Continuation pages legally print nothing - they do not vote.
+                page_heads.append({
+                    "page": pno,
+                    "doc_number": str(page_parsed.get("doc_number") or "").strip(),
+                    "doc_date": str(page_parsed.get("doc_date") or "").strip(),
+                    "supplier_nip": re.sub(
+                        r"\D", "", str(page_parsed.get("supplier_nip") or "")),
+                })
             pls = page_parsed.get("lines", []) or []
             merged.extend(pls)
             if multipage:
                 rc.log("doc %s: page %d/%d -> %d line(s)"
                        % (doc_id, pno, len(page_ids), len(pls)))
+        # faza1.1 task2: pages of ONE document must agree on their printed
+        # header. Two DIFFERENT invoices uploaded together otherwise merge
+        # into one doc silently (real case 23a163bc: 51994 + 53194 -> 16
+        # lines under the first number, stock would book two deliveries as
+        # one). A field with two+ distinct non-empty values across pages =
+        # sklejka -> needs_review + flag, never a silent merge.
+        if multipage and len(page_heads) > 1:
+            diff_parts = []
+            for fld, label in (("doc_number", "numery"),
+                               ("supplier_nip", "NIP"),
+                               ("doc_date", "daty")):
+                vals = []   # distinct values, first-seen spelling kept
+                seen = set()
+                for ph in page_heads:
+                    v = ph[fld]
+                    k = re.sub(r"\s+", " ", v.strip().lower())
+                    if k and k not in seen:
+                        seen.add(k)
+                        vals.append(v)
+                if len(vals) > 1:
+                    diff_parts.append("%s: %s" % (label, ", ".join(vals)))
+            if diff_parts:
+                sklejka = True
+                sklejka_msg = ("sklejka? strony wygladaja na ROZNE dokumenty "
+                               "(%s) - rozdziel i wgraj kazdy osobno"
+                               % "; ".join(diff_parts))
+                rc.log("doc %s: %s" % (doc_id, sklejka_msg))
         # Header from the page that carries supplier/number/date; fall back to
         # the first page (keeps currency etc. for an otherwise headerless page).
         parsed = header or first_parsed or {}
@@ -1555,6 +1643,11 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
             rc.log("doc %s: possible duplicate delivery of %s (key %s)"
                    % (doc_id, prev_doc, dedup_key))
     status = "duplicate" if is_dup else "needs_review"
+    # faza1.1 task2: a sklejka is a header-identity problem, not a duplicate -
+    # the merged header mimics the FIRST page's invoice (23a163bc pretended to
+    # be 51994 and lit "nowsza wersja"). The human decides; needs_review wins.
+    if sklejka:
+        status = "needs_review"
 
     # fx
     fx_rate, fx_date = (None, None)
@@ -1800,7 +1893,13 @@ def process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
         # already on the row (a manual fix or an earlier good read).
         "doc_kind": doc_kind,
         "doc_total_gross": gross_out,
+        # faza1.1 task2: written on EVERY parse, so a re-parse of corrected
+        # pages clears a stale flag. error_msg carries the detected numbers
+        # for the UI banner only when the flag is up.
+        "flag_sklejka": sklejka,
     }
+    if sklejka:
+        patch["error_msg"] = sklejka_msg
     if fx_rate is not None:
         patch["fx_rate_to_pln"] = "%.4f" % fx_rate
         patch["fx_rate_date"] = fx_date or ""

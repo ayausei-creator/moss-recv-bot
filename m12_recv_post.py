@@ -76,6 +76,73 @@ def find_posted_duplicate(d, doc_rows):
 
 
 # ---------------------------------------------------------------------------
+# faza1.1 task5: Dotypos supplier for the stockup (_supplierId). Dotypos keeps
+# suppliers with vatId = NIP; our documents carry supplier_nip (faza 1). Map
+# NIP -> Dotypos supplier id once per run; create the supplier when missing
+# (KSeF gives name + NIP). Best-effort ALL the way: any failure here only
+# logs - the stockup still goes out, just without _supplierId (the Supplier
+# column stays empty, exactly as before this task).
+# ---------------------------------------------------------------------------
+def doty_suppliers_by_nip(doty):
+    # {digits(vatId): supplier id} from GET /suppliers (get_all paginates).
+    out = {}
+    for s in doty.get_all("/suppliers"):
+        vat = re.sub(r"\D", "", str(s.get("vatId") or ""))
+        sid = s.get("id") or s.get("_id")
+        if vat and sid not in (None, "") and vat not in out:
+            out[vat] = str(sid)
+    return out
+
+
+def create_doty_supplier(doty, name, nip, dry):
+    # POST /suppliers with the minimal body {name, vatId}. Like /products the
+    # v2 create endpoints are bulk: body is an ARRAY, answer echoes an array.
+    body = {"name": (name or "NIP " + nip).strip(), "vatId": nip}
+    if dry:
+        rc.log("  dry: would POST /suppliers [%s]" % json.dumps(body))
+        return ""
+    status, data, hdrs = doty.post("/suppliers", [body])
+    sid = _extract_id(data, hdrs)
+    rc.log("created supplier %s (NIP %s) -> id %s (HTTP %s)"
+           % (body["name"], nip, sid or "?", status))
+    return sid
+
+
+def resolve_doty_supplier(doty, d, cache, dry):
+    # Dotypos supplier id for ONE document, or None (field is then omitted -
+    # never an error). cache = {"map": None|{nip: id}} shared across the run.
+    doc_id = d.get("doc_id")
+    nip = re.sub(r"\D", "", d.get("supplier_nip") or "")
+    if not nip:
+        rc.log("doc %s: no supplier_nip -> stockup without _supplierId" % doc_id)
+        return None
+    if cache.get("map") is None:
+        try:
+            cache["map"] = doty_suppliers_by_nip(doty)
+            rc.log("suppliers: %d in Dotypos (matched by vatId=NIP)"
+                   % len(cache["map"]))
+        except Exception as e:
+            rc.log("suppliers: GET /suppliers failed (%s) -> stockup without "
+                   "_supplierId" % e)
+            cache["map"] = {}
+    sid = cache["map"].get(nip)
+    if sid:
+        rc.log("doc %s: supplier NIP %s -> Dotypos id %s" % (doc_id, nip, sid))
+        return sid
+    name = (d.get("supplier_name_raw") or "").strip()
+    try:
+        sid = create_doty_supplier(doty, name, nip, dry)
+    except Exception as e:
+        rc.log("doc %s: create supplier (NIP %s) failed (%s) -> stockup "
+               "without _supplierId" % (doc_id, nip, e))
+        return None
+    if sid:
+        cache["map"][nip] = sid
+        return sid
+    return None
+
+
+# ---------------------------------------------------------------------------
 # schema probe (read-only). NOTE: there is NO GET to list stock-ups - a GET on
 # /warehouses/{id}/stockups returns HTTP 405 (create-only via POST). So we
 # verify connectivity and show the warehouse-product fields that a stock-up
@@ -544,6 +611,11 @@ def run_dry_to_telegram(doc_id):
     if not doc:
         rc.tg("M12 dry: nie znaleziono dokumentu %s" % doc_id)
         return "not found"
+    # faza1.1 task3: an order is never postable - say it instead of a preview.
+    if (doc.get("doc_kind") or "").strip().lower() == "zamowienie":
+        rc.tg("M12 dry: dokument %s to ZAMOWIENIE - to nie dokument dostawy, "
+              "nie podlega przyjeciu. Przyjmij fakture lub WZ." % doc_id)
+        return "zamowienie - not postable"
     dlines = [l for l in line_rows if (l.get("doc_id") or "") == doc_id
               and not rc.is_true(l.get("line_deleted"))]
     for l in dlines:
@@ -555,6 +627,8 @@ def run_dry_to_telegram(doc_id):
         doty, doc_id, dlines, True, catalog_name_map())  # dry -> no live creation
     invoice_number = (doc.get("doc_number") or "").strip() or ("WZ-" + str(doc_id)[:8])
     note = "M12 recv %s" % doc_id
+    # faza1.1 task5: show the REAL _supplierId the live post would send.
+    doty_sup = resolve_doty_supplier(doty, doc, {"map": None}, True)
 
     summary = _dry_summary_text(doc_id, invoice_number, priced, qtyonly,
                                 koszt_rows, tasks, skipped, notpostable)
@@ -571,8 +645,8 @@ def run_dry_to_telegram(doc_id):
     payload = {
         "doc_id": doc_id,
         "invoiceNumber": invoice_number,
-        "priced": stockup_body(priced, invoice_number, doc.get("supplier_id"), note, True) if priced else None,
-        "qtyonly": stockup_body(qtyonly, invoice_number, doc.get("supplier_id"), note, False) if qtyonly else None,
+        "priced": stockup_body(priced, invoice_number, doty_sup, note, True) if priced else None,
+        "qtyonly": stockup_body(qtyonly, invoice_number, doty_sup, note, False) if qtyonly else None,
         "koszt": [{k: v for k, v in kr.items() if not k.startswith("_")} for kr in koszt_rows],
         "tasks": tasks,
     }
@@ -629,8 +703,25 @@ def main():
     # Catalog name map for create_ingredient dedup (brief batch3 sec.4).
     cat_by_name = catalog_name_map()
 
+    # faza1.1 task5: NIP -> Dotypos supplier id, loaded lazily ONCE per run.
+    sup_cache = {"map": None}
+
     for d in approved:
         doc_id = d.get("doc_id")
+
+        # faza1.1 task3: an order (zamowienie) is NOT a delivery document -
+        # it says what was ORDERED, not what arrived (thin-text B2B order
+        # parsed qty=Lp: 3 l Oatly instead of 30). Never postable, NO override.
+        if (d.get("doc_kind") or "").strip().lower() == "zamowienie":
+            msg = ("Zamowienie to nie dokument dostawy - przyjmij fakture "
+                   "lub WZ.")
+            rc.log("doc %s: ZABLOKOWANY (zamowienie) - %s" % (doc_id, msg))
+            if not dry:
+                _set_doc(docs_ws, doc_headers, d,
+                         {"error_msg": msg, "updated_at": now_ts()})
+                rc.tg("M12 post: dokument %s NIE zaksiegowany - to "
+                      "zamowienie, nie dokument dostawy." % doc_id)
+            continue
 
         # faza1 task3: HARD duplicate guard, checked BEFORE anything with side
         # effects (create_product runs inside build_items on the live path).
@@ -671,10 +762,12 @@ def main():
         # invoiceNumber is required and must not be empty; fall back to a ref.
         invoice_number = (d.get("doc_number") or "").strip() or ("WZ-" + str(doc_id)[:8])
         note = "M12 recv %s" % doc_id
+        # faza1.1 task5: Dotypos supplier id by the document's NIP (or None).
+        doty_sup = resolve_doty_supplier(doty, d, sup_cache, dry)
         rc.log("doc %s: priced=%d, qtyonly=%d, koszt=%d, task=%d, skip=%d, notpostable=%d"
                % (doc_id, len(priced), len(qtyonly), len(koszt_rows), len(tasks),
                   skipped, len(notpostable)))
-        dry_report(doc_id, invoice_number, d.get("supplier_id"), note,
+        dry_report(doc_id, invoice_number, doty_sup, note,
                    priced, qtyonly, koszt_rows, tasks, skipped, notpostable)
 
         if dry:
@@ -690,7 +783,7 @@ def main():
             # Priced lines: update purchase price. Qty-only: leave price alone.
             for (group, with_price) in ((priced, True), (qtyonly, False)):
                 for chunk in _chunks(group, 100):
-                    cbody = stockup_body(chunk, invoice_number, d.get("supplier_id"),
+                    cbody = stockup_body(chunk, invoice_number, doty_sup,
                                          note, with_price)
                     status, data, hdrs = doty.post(STOCKUPS_PATH, cbody)
                     sid = _extract_id(data, hdrs)

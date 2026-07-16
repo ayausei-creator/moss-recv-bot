@@ -31,7 +31,7 @@ Output schema:
   "currency": "ISO code: PLN, EUR, USD, ... (PLN if a Polish document with zl)",
   "is_foreign": true or false (true if the seller is outside Poland),
   "doc_total_net": "total NET of the WHOLE document as printed in the summary (Razem netto / Suma netto), dot decimal, empty if the document prints no total",
-  "doc_kind": "type of the document as PRINTED in its title/layout: faktura | wz | paragon | inny; empty if the type is not readable (see rules)",
+  "doc_kind": "type of the document as PRINTED in its title/layout: faktura | wz | paragon | zamowienie | inny; empty if the type is not readable (see rules)",
   "doc_total_gross": "total GROSS of the WHOLE document as printed in the summary (Razem brutto / Do zaplaty / Suma brutto), dot decimal, empty if the document prints no gross total",
   "lines": [
     {
@@ -70,8 +70,11 @@ Rules:
     * "WZ", "Wydanie zewnetrzne", "Wydanie z magazynu", "Dowod wydania" -> wz
     * "Paragon fiskalny" or a fiscal receipt layout (cash-register footer,
       NIP kasy, fiscal logo) -> paragon
-    * a readable document of some OTHER type (zamowienie, proforma, oferta,
-      protokol) -> inny
+    * "Zamowienie", "Zamowienie nr ...", "Order", "Purchase order" ->
+      zamowienie. An order says what was ORDERED, not what was delivered -
+      it is never a delivery document, so naming it correctly matters.
+    * a readable document of some OTHER type (proforma, oferta, protokol)
+      -> inny
     * type not readable / not printed -> empty "". Never guess.
 - doc_total_gross: copy the PRINTED gross total of the whole document
   ("Razem brutto" / "Do zaplaty" / "Suma brutto" / "Razem z VAT"). Do not
