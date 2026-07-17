@@ -196,19 +196,49 @@ def with_backoff(fn, what="sheets", tries=None, base=None):
 _INGEST_LOCK_FH = None
 
 
+class LockConfigError(RuntimeError):
+    # faza1.2 Z1: the lock FILE cannot even be opened - wrong owner/perms (a
+    # root-run left /tmp/m12_ingest.lock as root:644 and the cron user could
+    # not open it). This is NEVER "another run active" and must fail loudly:
+    # on 17.07 the cron answered "lock busy"/exit 0 for 5 hours while four
+    # XMLs waited, indistinguishable from a healthy system.
+    pass
+
+
 def acquire_singleton_lock(path=INGEST_LOCK_PATH):
     # Non-blocking exclusive flock (brief batch2 sec.5). Returns True if THIS
-    # process now holds the lock, False if another run holds it. On a platform
-    # without fcntl we degrade to "always acquired" (dev boxes; the VPS is POSIX).
+    # process now holds the lock, False if another run REALLY holds it (flock
+    # busy). Raises LockConfigError when the file cannot be opened at all -
+    # the caller logs ERROR and exits non-zero so cron reports a failure.
+    # On a platform without fcntl we degrade to "always acquired" (dev boxes;
+    # the VPS is POSIX).
     global _INGEST_LOCK_FH
     if fcntl is None:
         return True
     try:
         fh = open(path, "w")
+    except (IOError, OSError) as e:
+        raise LockConfigError(
+            "cannot open lock file %s: %s - fix owner/perms "
+            "(a manual root run left it behind?)" % (path, e))
+    try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (IOError, OSError):
+        # flock EWOULDBLOCK/EAGAIN: genuinely held by another live process.
+        try:
+            fh.close()
+        except Exception:
+            pass
         return False
     _INGEST_LOCK_FH = fh  # keep the fd open for the whole run
+    try:
+        # faza1.2 Z1: root and the cron user (node) SHARE this lock file -
+        # world-writable so whichever creates it first does not shut the
+        # other out. Best-effort (chmod fails when we are not the owner,
+        # which means the perms were already broad enough to open it).
+        os.chmod(path, 0o666)
+    except OSError:
+        pass
     try:
         fh.write("%d\n" % os.getpid())
         fh.flush()

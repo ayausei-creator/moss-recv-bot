@@ -400,16 +400,44 @@ def parse_ksef_xml(path):
         row = {}
         for child in w.iter():
             row[local(child.tag)] = (child.text or "").strip()
+        name = row.get("P_7", "")
+        # faza1.2 Z5: the XML route has no LLM to derive the packaging from
+        # the name ("Oatly ... 1l/6" -> 1 l per piece), so EVERY line landed
+        # as JEDN? and Natalia typed the przelicznik by hand. Deterministic
+        # mirror of the prompt's unit_content rule; memory (dict by NIP)
+        # still takes priority downstream in translate_layer.
+        uc, us = unit_content_from_name(name)
         header["lines"].append({
             "lp": row.get("NrWierszaFa", ""),
-            "raw_name": row.get("P_7", ""),
+            "raw_name": name,
             "raw_supplier_code": row.get("P_6A", ""),
             "raw_qty": row.get("P_8B", ""),
             "raw_unit": row.get("P_8A", ""),
             "raw_unit_price": row.get("P_9A", ""),
             "raw_line_total": row.get("P_11", ""),
             "vat_rate": row.get("P_12", ""),
+            "unit_content": uc,
+            "unit_skl": us,
         })
+    # faza1.2 Z4: the printed NET total. FA(2)/FA(3) split the document net
+    # across P_13_x fields (one per VAT rate; P_13_6_1-style variants exist) -
+    # their sum IS "Razem netto". Fallback: the sum of line nets (P_11).
+    # Without this every XML doc had doc_total_net EMPTY: no suma? control,
+    # empty WARTOSC column in the Skrzynka, no amount key for the dup guard.
+    net_total = None
+    for key, els in idx.items():
+        if re.match(r"^P_13(_\d+)*$", key):
+            for el in els:
+                v = rc.to_float((el.text or "").strip())
+                if v is not None:
+                    net_total = (net_total or 0.0) + v
+    if net_total is None:
+        for ln in header["lines"]:
+            v = rc.to_float(ln.get("raw_line_total"))
+            if v is not None:
+                net_total = (net_total or 0.0) + v
+    if net_total is not None:
+        header["doc_total_net"] = "%.2f" % net_total
     return header
 
 
@@ -852,6 +880,33 @@ def doc_layer(ln):
 # should come from unit_content, NOT from a piece count.
 _NAME_MEASURE_RE = re.compile(r"\d[\d.,]*\s*(kg|dag|g|ml|cl|dl|l)\b", re.I)
 
+# faza1.2 Z5: deterministic mirror of the PARSE prompt's unit_content rule for
+# the LLM-free ksef_xml route. One explicit size token in the name = the size
+# of ONE document unit, converted to the warehouse base unit (kg / l).
+_NAME_SIZE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(kg|dag|g|ml|cl|dl|l)\b", re.I)
+_SIZE_TO_BASE = {
+    "kg": ("kg", 1.0), "dag": ("kg", 0.01), "g": ("kg", 0.001),
+    "l": ("l", 1.0), "dl": ("l", 0.1), "cl": ("l", 0.01), "ml": ("l", 0.001),
+}
+
+
+def unit_content_from_name(name):
+    # "OATLY Barista 1l/6" -> ("1", "l"); "SER 950g" -> ("0.95", "kg");
+    # "CZEKOLADA 2,5kg/8" -> ("2.5", "kg"). The trailing "/6"-style carton
+    # hint has no unit, so it is never read as a size (mirrors carton_hint).
+    # Ambiguous names with TWO different sizes ("...2,5kg/1,5kg...") return
+    # ("", "") - never guess; those stay JEDN? for the manager, like today.
+    found = set()
+    for m in _NAME_SIZE_RE.finditer(name or ""):
+        val = rc.to_float(m.group(1))
+        unit, fac = _SIZE_TO_BASE[m.group(2).lower()]
+        if val is not None and val > 0:
+            found.add((round(val * fac, 6), unit))
+    if len(found) != 1:
+        return "", ""
+    content, unit = next(iter(found))
+    return _fmt(content), unit
+
 
 def _name_has_measure(name):
     return bool(_NAME_MEASURE_RE.search(name or ""))
@@ -1094,6 +1149,57 @@ def _run_post_dry(doc_id, req_token, row_num, dry):
 
 
 # ---------------------------------------------------------------------------
+# faza1.2 Z2: alert when the ingest is NOT working. N consecutive "lock busy"
+# exits look exactly like a healthy idle system (17.07: 5 hours, 50 runs,
+# status "ok", four XMLs waiting). A tiny state file in /tmp tracks the FIRST
+# busy timestamp; when the streak lasts >= 30 min we send ONE telegram alert
+# (no spam - the alerted bit sticks until a successful run resets the file).
+# Time-based rather than a pure run counter, so the every-minute --if-requested
+# trigger hitting a busy lock during one long legitimate parse cannot
+# false-alert (a success always resets the streak).
+# ---------------------------------------------------------------------------
+LOCK_BUSY_STATE_PATH = "/tmp/m12_ingest_lockbusy.state"
+LOCK_BUSY_ALERT_MIN = 30
+
+
+def _lock_busy_tick():
+    # Called on every "lock busy" exit. File format: "first_epoch count alerted".
+    now = int(time.time())
+    first, count, alerted = now, 0, 0
+    try:
+        with open(LOCK_BUSY_STATE_PATH) as f:
+            p = (f.read() or "").split()
+            first, count, alerted = int(p[0]), int(p[1]), int(p[2])
+    except Exception:
+        pass
+    count += 1
+    mins = max(0, (now - first) // 60)
+    do_alert = mins >= LOCK_BUSY_ALERT_MIN and not alerted
+    if do_alert:
+        alerted = 1
+    try:
+        with open(LOCK_BUSY_STATE_PATH, "w") as f:
+            f.write("%d %d %d\n" % (first, count, alerted))
+        os.chmod(LOCK_BUSY_STATE_PATH, 0o666)  # root and node share it
+    except Exception:
+        pass
+    rc.log("ingest: lock busy streak: %d run(s), %d min%s"
+           % (count, mins, " -> ALERT" if do_alert else ""))
+    if do_alert:
+        rc.tg("M12 ingest: nie parsuje od %d min - lock zajety (%d kolejnych "
+              "przebiegow 'lock busy'). Sprawdz proces ingest i plik locka."
+              % (mins, count))
+
+
+def _lock_busy_reset():
+    # A successful lock acquisition ends the streak (and re-arms the alert).
+    try:
+        os.remove(LOCK_BUSY_STATE_PATH)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main():
@@ -1120,9 +1226,21 @@ def main():
     # Cross-process mutex (brief batch2 sec.5, level 1): the */5 ingest and the
     # */3 --if-requested trigger must never parse concurrently. A second run that
     # cannot get the lock exits silently (0), so cron does not alert on it.
-    if not rc.acquire_singleton_lock():
+    # faza1.2 Z1: a lock file we cannot even OPEN is a config error, not
+    # "busy" - fail loudly (non-zero exit + telegram) so cron reports it
+    # instead of impersonating a healthy system for hours.
+    try:
+        got_lock = rc.acquire_singleton_lock()
+    except rc.LockConfigError as e:
+        rc.log("ingest: LOCK ERROR (konfiguracja, nie zajetosc): %s" % e)
+        rc.tg("M12 ingest: BLAD locka (uprawnienia pliku, nie zajetosc): %s"
+              % str(e)[:250])
+        return 2
+    if not got_lock:
         rc.log("ingest: another run active (lock busy) -> exit 0")
+        _lock_busy_tick()
         return 0
+    _lock_busy_reset()
     run_id = uuid.uuid4().hex[:12]
     rc.log("ingest: run_id=%s holds the ingest lock" % run_id)
 

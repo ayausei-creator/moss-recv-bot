@@ -46,33 +46,76 @@ def now_ts():
 # again; when the number is unreadable the parse-time dedup_key is the
 # fallback identity. The only way through is the explicit one-shot
 # Recv_Docs.dup_override=TRUE that the console sets on "To osobna dostawa".
+# faza1.2 Z3: the SAME invoice arrives via several channels (photo at the
+# door -> PDF -> KSeF-XML) with a DECORATED number ("75630/01/07/2026" on the
+# PDF vs "FS 75630/01/07/2026" in the XML) - so (a) numbers are compared
+# after normalization, and (b) a second, number-free key catches the rest:
+# NIP + doc_date + net amount (printed doc_total_net, else the sum of line
+# nets; tolerance 1 grosz).
 # ---------------------------------------------------------------------------
+def _norm_doc_number(num):
+    # Strip the document-type prefix (FS/FV/FA/F, with or without a dot) and
+    # ALL whitespace, lowercase. The prefix is stripped only when digits
+    # follow, so "FAK-9/22" style numbers keep their letters. The original
+    # stays in doc_number - this form is for comparison only.
+    s = (num or "").strip().lower()
+    s = re.sub(r"^(?:fs|fv|fa|f)\.?[\s./-]*(?=\d)", "", s)
+    return re.sub(r"\s+", "", s)
+
+
 def _dup_identity(d):
     nip = re.sub(r"\D", "", d.get("supplier_nip") or "")
-    num = re.sub(r"\s+", " ", (d.get("doc_number") or "").strip().lower())
-    return nip, num
+    return nip, _norm_doc_number(d.get("doc_number"))
 
 
-def find_posted_duplicate(d, doc_rows):
-    # First OTHER document with status=posted and the same identity, or None.
-    # Primary key needs BOTH nip and number; with either missing we fall back
-    # to dedup_key (which the ingest only sets when the doc carries enough
-    # identity, so a blank scan can never collide with another blank scan).
+def _doc_net_amount(d, lines_by_doc):
+    # Net amount for the Z3(b) key: printed doc_total_net, else the sum of the
+    # document's line nets (deleted lines excluded). None when neither exists.
+    v = rc.to_float(d.get("doc_total_net"))
+    if v is not None:
+        return v
+    total = None
+    for l in (lines_by_doc or {}).get((d.get("doc_id") or "").strip(), []):
+        if rc.is_true(l.get("line_deleted")):
+            continue
+        lv = rc.to_float(l.get("total_doc_net") or l.get("raw_line_total"))
+        if lv is not None:
+            total = (total or 0.0) + lv
+    return total
+
+
+def find_posted_duplicate(d, doc_rows, lines_by_doc=None):
+    # First OTHER document with status=posted and the same identity, else None.
+    # Returns (doc, reason) with reason in {"numer", "kwota", "dedup_key"}.
+    # Primary key needs BOTH nip and number; the amount key needs nip + date +
+    # amount; with no usable number we also try the parse-time dedup_key
+    # (which the ingest only sets when the doc carries enough identity, so a
+    # blank scan can never collide with another blank scan).
     doc_id = (d.get("doc_id") or "").strip()
     nip, num = _dup_identity(d)
     dk = (d.get("dedup_key") or "").strip()
+    date = (d.get("doc_date") or "").strip()
+    amount = _doc_net_amount(d, lines_by_doc) if (nip and date) else None
     for o in doc_rows:
         oid = (o.get("doc_id") or "").strip()
         if not oid or oid == doc_id:
             continue
         if (o.get("status") or "").strip() != "posted":
             continue
-        if nip and num:
-            if _dup_identity(o) == (nip, num):
-                return o
-        elif dk and (o.get("dedup_key") or "").strip() == dk:
-            return o
-    return None
+        if nip and num and _dup_identity(o) == (nip, num):
+            return o, "numer"
+        # Z3(b): same supplier + same issue date + same net amount = the same
+        # delivery from another channel, whatever the number decoration.
+        if amount is not None and (o.get("doc_date") or "").strip() == date:
+            onip, _ = _dup_identity(o)
+            if onip == nip:
+                oam = _doc_net_amount(o, lines_by_doc)
+                # round first: 2364.86-2364.85 is 0.010000000000218 in floats
+                if oam is not None and abs(round(oam - amount, 2)) <= 0.01:
+                    return o, "kwota"
+        if (not (nip and num)) and dk and (o.get("dedup_key") or "").strip() == dk:
+            return o, "dedup_key"
+    return None, ""
 
 
 # ---------------------------------------------------------------------------
@@ -633,13 +676,20 @@ def run_dry_to_telegram(doc_id):
     summary = _dry_summary_text(doc_id, invoice_number, priced, qtyonly,
                                 koszt_rows, tasks, skipped, notpostable)
     # faza1 task3: warn in the Telegram preview when the live post would be
-    # blocked by the hard duplicate guard (same NIP+numer already posted).
-    dup = find_posted_duplicate(doc, doc_rows)
+    # blocked by the hard duplicate guard. faza1.2 Z3: both signals (number
+    # after normalization, NIP+date+amount from another channel).
+    lines_by_doc_all = {}
+    for l in line_rows:
+        lines_by_doc_all.setdefault((l.get("doc_id") or "").strip(), []).append(l)
+    dup, dup_why = find_posted_duplicate(doc, doc_rows, lines_by_doc_all)
     if dup and not rc.is_true(doc.get("dup_override")):
-        summary = ("UWAGA: mozliwy duplikat - ten sam NIP+numer juz "
+        why = ("ten sam NIP+numer" if dup_why == "numer"
+               else "ten sam NIP+data+kwota (inny kanal)"
+               if dup_why == "kwota" else "ten sam dedup_key")
+        summary = ("UWAGA: mozliwy duplikat - %s juz "
                    "zaksiegowany (dokument %s). post --live zablokuje bez "
                    "'To osobna dostawa' (dup_override).\n\n"
-                   % dup.get("doc_id")) + summary
+                   % (why, dup.get("doc_id"))) + summary
     rc.tg_long(summary)
 
     payload = {
@@ -726,28 +776,33 @@ def main():
         # faza1 task3: HARD duplicate guard, checked BEFORE anything with side
         # effects (create_product runs inside build_items on the live path).
         # In --dry it only warns, so the preview still shows what WOULD go.
-        dup = find_posted_duplicate(d, doc_rows)
+        # faza1.2 Z3: dwa sygnaly - znormalizowany numer LUB NIP+data+kwota
+        # (ten sam dokument z innego kanalu: foto -> PDF -> KSeF-XML).
+        dup, dup_why = find_posted_duplicate(d, doc_rows, lines_by_doc)
         if dup:
             dup_id = dup.get("doc_id")
+            why = ("ten sam NIP+numer" if dup_why == "numer"
+                   else "ten sam NIP+data+kwota (inny kanal)"
+                   if dup_why == "kwota" else "ten sam dedup_key")
             if rc.is_true(d.get("dup_override")):
-                rc.log("doc %s: mozliwy duplikat %s (posted), ale dup_override="
-                       "TRUE ('to osobna dostawa') -> gard ominiety"
-                       % (doc_id, dup_id))
+                rc.log("doc %s: mozliwy duplikat %s (posted, %s), ale "
+                       "dup_override=TRUE ('to osobna dostawa') -> gard ominiety"
+                       % (doc_id, dup_id, why))
             elif dry:
-                rc.log("doc %s: UWAGA mozliwy duplikat %s (posted, ten sam "
-                       "NIP+numer) - --live zablokuje bez dup_override"
-                       % (doc_id, dup_id))
+                rc.log("doc %s: UWAGA mozliwy duplikat %s (posted, %s) - "
+                       "--live zablokuje bez dup_override"
+                       % (doc_id, dup_id, why))
             else:
-                msg = ("mozliwy duplikat: ten sam NIP+numer co dokument %s "
+                msg = ("mozliwy duplikat: %s co dokument %s "
                        "(posted, stockup %s). Nie zaksiegowano. W konsoli "
                        "zaznacz 'To osobna dostawa' (dup_override) i powtorz."
-                       % (dup_id, (dup.get("stockup_id") or "").strip() or "-"))
+                       % (why, dup_id, (dup.get("stockup_id") or "").strip() or "-"))
                 rc.log("doc %s: ZABLOKOWANY - %s" % (doc_id, msg))
                 _set_doc(docs_ws, doc_headers, d,
                          {"error_msg": msg, "updated_at": now_ts()})
                 rc.tg("M12 post: dokument %s NIE zaksiegowany - mozliwy "
-                      "duplikat %s (ten sam NIP+numer, juz posted). Override: "
-                      "'To osobna dostawa' w konsoli." % (doc_id, dup_id))
+                      "duplikat %s (%s, juz posted). Override: "
+                      "'To osobna dostawa' w konsoli." % (doc_id, dup_id, why))
                 continue
 
         dlines = lines_by_doc.get(doc_id, [])
