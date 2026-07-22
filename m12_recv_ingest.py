@@ -1571,7 +1571,12 @@ def main():
         else:
             _stamp_result(False, last_err or "dokument nie znaleziony / nie przetworzony")
     elif _CLAIM.get("kind") == "scan":
-        _stamp_result(True, "%d plikow, %d dok." % (len(files), docs_ok))
+        # Q3: liczymy NOWE pliki (ten sam licznik co log "scan: N new file(s)"),
+        # nie caly inbox - stare/znane pliki nie sa wynikiem tego klikniecia.
+        if len(new_doc_rows) == 0:
+            _stamp_result(True, "brak nowych plikow")
+        else:
+            _stamp_result(True, "%d nowych, %d dok." % (len(new_doc_rows), docs_ok))
 
     return 0
 
