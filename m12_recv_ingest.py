@@ -1172,6 +1172,16 @@ def _run_post_dry(doc_id, req_token, row_num, dry):
     except Exception as e:
         rc.log("post_dry FAILED for %s: %s" % (doc_id, e))
         rc.tg("M12 dry blad doc %s: %s" % (doc_id, str(e)[:200]))
+        # pathA 1.3: trwaly blad sam sie nie naprawi - stempluj done, zeby
+        # trigger nie strzelal w kolo; uzytkownik widzi note i reaguje
+        # (ponowny klik = nowy token = nowa proba).
+        try:
+            _stamp_control(row_num, {"post_dry_done": req_token,
+                                     "post_dry_note": "dry error %s: %s"
+                                                      % (now_ts(), str(e)[:200]),
+                                     "updated_at": now_ts()})
+        except Exception as e2:
+            rc.log("post_dry: error stamp FAILED: %s" % e2)
 
 
 # ---------------------------------------------------------------------------
