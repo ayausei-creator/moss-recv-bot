@@ -48,7 +48,9 @@ REVIEW = 0.70
 # claimed AND recent enough. The app writes epoch-ms tokens (Date.now()), which
 # are timezone-independent, so this stays correct regardless of the container's
 # timezone. Overridable via env for tuning without a redeploy.
-SCAN_FRESH_SECONDS = int(os.environ.get("M12_SCAN_FRESH_SECONDS", "3600") or "3600")
+# pathA: 900 s - z cronem co 1-3 min klik starszy niz kwadrans jest martwy;
+# nie odpalamy razboru na wczorajszy przycisk po dlugim przestoju crona.
+SCAN_FRESH_SECONDS = int(os.environ.get("M12_SCAN_FRESH_SECONDS", "900") or "900")
 
 
 def now_ts():
@@ -1021,6 +1023,30 @@ def _stamp_control(row_num, patch):
         rc.set_cell(ws, rc.CONTROL_HEADERS, row_num, k, v)
 
 
+# pathA: the scan/rescan request claimed by THIS run - remembered at module
+# level so EVERY exit path (normal return, FATAL handler at the bottom) can
+# stamp the final result into Recv_Control. Schema unchanged: the verdict goes
+# into the existing note/rescan_note; scan_done/rescan_done stay = request
+# (the anti-loop claim marker is not touched).
+_CLAIM = {"kind": None, "row": None, "doc_id": "", "route": ""}
+
+
+def _stamp_result(ok, detail):
+    # One stamp per run: "scan ok <ts>: ..." / "scan error <ts>: ..." (same for
+    # rescan). No-op when this run claimed nothing (plain cron tick, full scan).
+    kind, row = _CLAIM.get("kind"), _CLAIM.get("row")
+    if not kind or not row:
+        return
+    _CLAIM["kind"] = None
+    field = "note" if kind == "scan" else "rescan_note"
+    note = "%s %s %s: %s" % (kind, "ok" if ok else "error", now_ts(), detail)
+    try:
+        _stamp_control(row, {field: note, "updated_at": now_ts()})
+        rc.log("if-requested: result stamped -> %s" % note)
+    except Exception as e:
+        rc.log("if-requested: result stamp FAILED: %s" % e)
+
+
 def claim_requests(dry=False):
     # ONE Recv_Control read: scan_request + post_dry_request + rescan_request
     # (batch5 task4) checked together. Returns (scan_token, dry_req, rescan_req,
@@ -1146,6 +1172,16 @@ def _run_post_dry(doc_id, req_token, row_num, dry):
     except Exception as e:
         rc.log("post_dry FAILED for %s: %s" % (doc_id, e))
         rc.tg("M12 dry blad doc %s: %s" % (doc_id, str(e)[:200]))
+        # pathA 1.3: trwaly blad sam sie nie naprawi - stempluj done, zeby
+        # trigger nie strzelal w kolo; uzytkownik widzi note i reaguje
+        # (ponowny klik = nowy token = nowa proba).
+        try:
+            _stamp_control(row_num, {"post_dry_done": req_token,
+                                     "post_dry_note": "dry error %s: %s"
+                                                      % (now_ts(), str(e)[:200]),
+                                     "updated_at": now_ts()})
+        except Exception as e2:
+            rc.log("post_dry: error stamp FAILED: %s" % e2)
 
 
 # ---------------------------------------------------------------------------
@@ -1259,12 +1295,17 @@ def main():
             args.doc = rescan_req[0]
             args.force = True
             args.route = rescan_req[1]
+            if not args.dry:
+                _CLAIM.update({"kind": "rescan", "row": ctrl_row,
+                               "doc_id": rescan_req[0], "route": rescan_req[1]})
             rc.log("if-requested: rescan doc %s route=%s -> targeted ingest"
                    % rescan_req)
         elif not token:
             rc.log("if-requested: no fresh scan request; nothing more to do")
             return 0
         else:
+            if not args.dry:
+                _CLAIM.update({"kind": "scan", "row": ctrl_row})
             rc.log("if-requested: fresh scan request %s -> running ingest" % token)
 
     parse_prompt, match_prompt = load_prompts()
@@ -1272,6 +1313,7 @@ def main():
         rc.log("FATAL: empty PARSE prompt - check the [[PARSE]] marker in %s"
                % rc.PROMPT_FILE)
         rc.tg("M12 ingest: pusty PARSE prompt - sprawdz plik promptu")
+        _stamp_result(False, "pusty PARSE prompt")
         return 1
     if args.force and not args.dry:
         rc.log("WARNING: --force without --dry may append duplicate lines for "
@@ -1498,12 +1540,18 @@ def main():
         "force_route": (args.route or "").strip(),
         "old_lines_by_doc": old_lines_by_doc,
     }
+    docs_ok = 0
+    docs_failed = 0
+    last_err = ""
     for d in todo:
         try:
             process_doc(d, parse_prompt, match_prompt, dict_idx, sup_by_nip, cat_rows,
                         docs_ws, doc_headers, lines_ws, line_headers,
                         ctx, args.dry)
+            docs_ok += 1
         except Exception as e:
+            docs_failed += 1
+            last_err = str(e)[:160]
             rc.log("doc %s FAILED: %s" % (d.get("doc_id"), e))
             if not args.dry and d.get("_row"):
                 try:
@@ -1512,6 +1560,23 @@ def main():
                 except Exception:
                     pass
             rc.tg("M12 ingest blad doc %s: %s" % (d.get("doc_id"), str(e)[:200]))
+
+    # pathA: final verdict of the claimed request -> Recv_Control, so the UI can
+    # show it. Scan: run-level ok (per-doc errors already live on the doc rows).
+    # Rescan targets ONE doc, so its failure IS the request's failure.
+    if _CLAIM.get("kind") == "rescan":
+        if docs_ok > 0 and docs_failed == 0:
+            _stamp_result(True, "doc %s (%s)"
+                          % ((_CLAIM.get("doc_id") or "")[:8], _CLAIM.get("route") or ""))
+        else:
+            _stamp_result(False, last_err or "dokument nie znaleziony / nie przetworzony")
+    elif _CLAIM.get("kind") == "scan":
+        # Q3: liczymy NOWE pliki (ten sam licznik co log "scan: N new file(s)"),
+        # nie caly inbox - stare/znane pliki nie sa wynikiem tego klikniecia.
+        if len(new_doc_rows) == 0:
+            _stamp_result(True, "brak nowych plikow")
+        else:
+            _stamp_result(True, "%d nowych, %d dok." % (len(new_doc_rows), docs_ok))
 
     return 0
 
@@ -2140,5 +2205,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as e:
         rc.log("ingest: FATAL %s" % e)
+        # pathA: a claimed scan/rescan must not die silently for the UI.
+        _stamp_result(False, str(e)[:200])
         rc.tg("M12 ingest fatal: %s" % str(e)[:300])
         sys.exit(1)
