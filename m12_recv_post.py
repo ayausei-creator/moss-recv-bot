@@ -26,6 +26,7 @@
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -723,6 +724,8 @@ def main():
     ap.add_argument("--probe", action="store_true", help="read existing stockups and exit")
     ap.add_argument("--limit", type=int, default=1, help="max approved docs this run")
     ap.add_argument("--doc", default="", help="process only this doc_id")
+    ap.add_argument("--requested-by", default="",
+                    help="who requested the posting (console user) - for the TG log")
     args = ap.parse_args()
 
     doty = rc.Doty()
@@ -903,10 +906,33 @@ def main():
                   # a stale "mozliwy duplikat" message must not survive a
                   # successful (overridden) post
                   "error_msg": "", "updated_at": now_ts()})
-        rc.tg("M12 post: dokument %s zaksiegowany (stockup %s; %d z cena, %d bez ceny)"
-              % (doc_id, stockup_id, len(priced), len(qtyonly)))
+        # post-button: the SUCCESS log goes to a dedicated target (env
+        # M12_TG_POST_TARGET), NOT to the Admin digest group; unset/empty env
+        # = silent success. Errors/dup-blocks/fatal above stay on rc.tg (Admin).
+        _tg_post_success(
+            "M12 przyjecie: %s | nr %s | %d poz. | %s PLN netto | stockup %s%s"
+            % ((d.get("supplier_name_raw") or d.get("supplier_id") or "-").strip() or "-",
+               (d.get("doc_number") or "-").strip() or "-",
+               len(priced) + len(qtyonly),
+               (d.get("doc_total_net") or "-").strip() or "-",
+               stockup_id or "-",
+               (" | przyjal: " + args.requested_by) if args.requested_by else ""))
 
     return 0
+
+
+def _tg_post_success(msg):
+    # Dedicated success channel for real postings. No target configured -> no
+    # message at all (the Admin group must not be flooded by routine receipts).
+    target = (os.environ.get("M12_TG_POST_TARGET") or "").strip()
+    if not target:
+        rc.log("post: M12_TG_POST_TARGET not set - success TG skipped")
+        return
+    cmd = [rc.OPENCLAW_BIN, "message", "send", "--channel", "telegram",
+           "--target", target, "--message", rc.clean_msg(msg) or "(pusty komunikat)"]
+    code, _out, err = rc._run(cmd)
+    if code != 0:
+        rc.log("post: success TG send failed: " + (err or "")[:300])
 
 
 def _set_doc(docs_ws, doc_headers, d, patch):

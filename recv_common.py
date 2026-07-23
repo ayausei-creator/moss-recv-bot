@@ -140,7 +140,13 @@ CONTROL_HEADERS = ["key", "scan_request", "scan_requested_by",
                    # FORCED route. Token "<doc_id>#<pdf-text|vision>#<epoch_ms>";
                    # the trigger claims it via rescan_done (scan-style).
                    "rescan_request", "rescan_requested_by",
-                   "rescan_done", "rescan_note"]
+                   "rescan_done", "rescan_note",
+                   # post-button: REAL posting request ("Przyjmij na magazyn" on
+                   # an approved doc). Token "<doc_id>#<epoch_ms>"; claim-before
+                   # (post_done stamped at claim, scan-style) - a crash must
+                   # NEVER re-fire a live stock-up (double posting risk).
+                   "post_request", "post_requested_by",
+                   "post_done", "post_note"]
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +476,7 @@ def control_row():
     try:
         sh = _spreadsheet(RECV_SHEET_ID)
         resp = with_backoff(
-            lambda: sh.values_get("%s!A%d:N" % (TAB_CONTROL, HEADER_ROW)),
+            lambda: sh.values_get("%s!A%d:R" % (TAB_CONTROL, HEADER_ROW)),
             what="control read")
     except Exception as e:
         log("control read skipped: %s" % e)
