@@ -51,9 +51,11 @@ REVIEW = 0.70
 # pathA: 900 s - z cronem co 1-3 min klik starszy niz kwadrans jest martwy;
 # nie odpalamy razboru na wczorajszy przycisk po dlugim przestoju crona.
 SCAN_FRESH_SECONDS = int(os.environ.get("M12_SCAN_FRESH_SECONDS", "900") or "900")
-# post-button: OWN, shorter window for the REAL posting request - a stale
-# "Przyjmij na magazyn" click must die quickly (money moves on this one).
-POST_FRESH_SECONDS = int(os.environ.get("M12_POST_FRESH_SECONDS", "300") or "300")
+# post-queue: dokument w statusie "posting" starszy niz ten prog = przerwane
+# przyjmowanie (crash miedzy POST do Dotypos a zapisem "posted"). Przechodzi
+# w "error" - NIGDY auto-requeue (ryzyko podwojnego stockupu); czlowiek
+# sprawdza w Dotypos i klika ponownie.
+POST_STUCK_SECONDS = int(os.environ.get("M12_POST_STUCK_SECONDS", "600") or "600")
 
 
 def now_ts():
@@ -1051,67 +1053,81 @@ def _stamp_result(ok, detail):
 
 
 def claim_requests(dry=False):
-    # ONE Recv_Control read: post_request + scan_request + post_dry_request +
-    # rescan_request checked together. Returns (scan_token, dry_req, rescan_req,
-    # post_req, row_num). ONE claim per tick, priority post > rescan > scan:
-    # a fresh post/rescan takes THIS tick; the others stay UNCLAIMED for the
-    # next one. post_dry is only detected here - main() stamps post_dry_done
-    # after the dry preview is actually sent, so a crash re-fires it.
+    # ONE Recv_Control read (scan/rescan/post_dry) + ONE Recv_Docs read (post
+    # queue). Returns (scan_token, dry_req, rescan_req, post_req, row_num).
+    # ONE claim per tick, priority: post-queue > rescan > scan - a queued doc
+    # takes THIS tick, the others stay UNCLAIMED for the next one. post_dry is
+    # only detected here - main() stamps post_dry_done after the dry preview
+    # is actually sent, so a crash re-fires it.
     row, row_num = rc.control_row()
     if not row:
         return None, None, None, None, None
     dry_req = _detect_post_dry(row, row_num, dry)   # (doc_id, token) or None
-    post_req = _claim_post(row, row_num, dry)       # (doc_id, requested_by) or None
+    post_req = _claim_queued(dry)                   # (doc_id, requested_by) or None
     rescan_req = None if post_req else _claim_rescan(row, row_num, dry)
     scan_token = None if (post_req or rescan_req) else _claim_scan(row, row_num, dry)
     return scan_token, dry_req, rescan_req, post_req, row_num
 
 
-def _claim_post(row, row_num, dry):
-    # post-button: REAL posting of ONE approved doc. Token "<doc_id>#<epoch_ms>".
-    # CLAIM-BEFORE (post_done stamped now, scan-style): a crash between the
-    # Dotypos POST and the status write must NEVER re-fire - that would create
-    # a DOUBLE stock-up. Worst case of claim-before is a burnt request with no
-    # posting (visible in post_note / doc status); a new click = a new token.
-    req = str(row.get("post_request") or "").strip()
-    done = str(row.get("post_done") or "").strip()
-    if not req or req == done:
-        return None
-    doc_id, _, ms_part = req.partition("#")
-    doc_id = doc_id.strip()
+# post-queue: kto zaklikal - ostatni wpis "QUEUED: ... (kto, ts)" w notes.
+_QUEUED_BY_RE = re.compile(r"QUEUED:[^(]*\(([^,)]*)")
+
+
+def _claim_queued(dry):
+    # post-queue: the queue lives ON THE DOC ROWS (status="queued"), not in a
+    # single Recv_Control slot - clicks can never overwrite each other. Take
+    # ONE doc per tick, FIFO by updated_at (a queued doc is locked in the UI,
+    # so updated_at = moment of queueing), tiebreak doc_id. Before picking:
+    # flip stuck "posting" (older than POST_STUCK_SECONDS) to "error" - the
+    # stock-up may or may not have hit Dotypos, so NO auto-requeue, ever.
     try:
-        req_ms = int(float(ms_part))
-    except (TypeError, ValueError):
-        req_ms = 0
-    now_ms = int(time.time() * 1000)
-    stale = bool(req_ms and (now_ms - req_ms) > POST_FRESH_SECONDS * 1000)
-    if stale or not doc_id:
-        rc.log("if-requested: post request %r %s, ignored"
-               % (req, "stale" if stale else "invalid"))
-        if not dry:
-            _stamp_control(row_num, {"post_done": req,
-                                     "post_note": "ignored (stale/invalid)",
-                                     "updated_at": now_ts()})
+        wsD = rc.open_ws(rc.TAB_DOCS)
+        hdrD, rowsD = rc.read_records(wsD)
+    except Exception as e:
+        rc.log("queue: Recv_Docs read failed: %s" % e)
         return None
-    who = str(row.get("post_requested_by") or "").strip()
+    for d in rowsD:
+        if (d.get("status") or "").strip() != "posting":
+            continue
+        age = _claim_age_seconds((d.get("updated_at") or "").strip())
+        if age is None or age <= POST_STUCK_SECONDS:
+            continue
+        rc.log("queue: doc %s stuck in posting (%ds) -> error"
+               % (d.get("doc_id"), age))
+        if not dry and d.get("_row"):
+            rc.set_cell(wsD, hdrD, d["_row"], "status", "error")
+            rc.set_cell(wsD, hdrD, d["_row"], "error_msg",
+                        "przyjmowanie przerwane - sprawdz w Dotypos, "
+                        "czy stockup powstal, zanim ponowisz")
+            rc.set_cell(wsD, hdrD, d["_row"], "updated_at", now_ts())
+    queued = [d for d in rowsD if (d.get("status") or "").strip() == "queued"]
+    if not queued:
+        return None
+    queued.sort(key=lambda d: ((d.get("updated_at") or ""), (d.get("doc_id") or "")))
+    d = queued[0]
+    doc_id = (d.get("doc_id") or "").strip()
+    m = _QUEUED_BY_RE.findall(d.get("notes") or "")
+    who = (m[-1].strip() if m else "")
     if dry:
-        rc.log("if-requested (dry): would claim post %s (by %s)" % (doc_id, who or "-"))
-        return (doc_id, who)
-    _stamp_control(row_num, {"post_done": req,
-                             "post_note": "post started %s" % now_ts(),
-                             "updated_at": now_ts()})
+        rc.log("queue (dry): would take doc %s (by %s, %d in queue)"
+               % (doc_id, who or "-", len(queued)))
+    else:
+        rc.log("queue: taking doc %s (by %s, %d in queue)"
+               % (doc_id, who or "-", len(queued)))
     return (doc_id, who)
 
 
-def _run_post_live(doc_id, requested_by, row_num, dry):
-    # post-button: run the battle-tested live path AS A SUBPROCESS (no refactor
-    # of m12_recv_post.main). The verdict for post_note comes from RE-READING
-    # the doc row (source of truth), not from stdout: posted+stockup_id = ok;
-    # anything else = error with error_msg / status.
-    rc.log("if-requested: post_request -> LIVE post doc %s (by %s)"
-           % (doc_id, requested_by or "-"))
+def _run_post_live(doc_id, requested_by, dry):
+    # post-queue: run the battle-tested live path AS A SUBPROCESS (no refactor
+    # of m12_recv_post.main). The doc row IS the verdict the UI shows (badge
+    # from status), no Recv_Control stamps. One trap: a queued doc blocked by
+    # a guard in post.py (zamowienie / duplikat) keeps status="queued" - the
+    # trigger would retry it every minute forever. Re-read after the run and
+    # flip such a doc to "error" (keeping post.py's error_msg) to break the
+    # loop; the button becomes active again in the console.
+    rc.log("queue: LIVE post doc %s (by %s)" % (doc_id, requested_by or "-"))
     if dry:
-        rc.log("if-requested (dry): would run post --live --doc %s" % doc_id)
+        rc.log("queue (dry): would run post --live --doc %s" % doc_id)
         return
     cmd = [sys.executable, "m12_recv_post.py", "--live",
            "--doc", doc_id, "--limit", "1"]
@@ -1124,32 +1140,37 @@ def _run_post_live(doc_id, requested_by, row_num, dry):
         if res.returncode != 0:
             sub_err = "exit %d" % res.returncode
     except subprocess.TimeoutExpired:
-        sub_err = "timeout 600s - sprawdz status dokumentu"
+        # the child was killed mid-flight: the doc sits in "posting" and the
+        # stuck-check will flip it to error after POST_STUCK_SECONDS.
         rc.log("post subprocess TIMEOUT for %s" % doc_id)
+        return
     except Exception as e:
         sub_err = str(e)[:160]
         rc.log("post subprocess FAILED for %s: %s" % (doc_id, e))
-    note = ""
     try:
-        _, rowsD = rc.read_records(rc.open_ws(rc.TAB_DOCS))
+        wsD = rc.open_ws(rc.TAB_DOCS)
+        hdrD, rowsD = rc.read_records(wsD)
         d = next((x for x in rowsD if (x.get("doc_id") or "").strip() == doc_id), None)
         st = (d.get("status") or "").strip() if d else ""
         if st == "posted":
-            sid = (d.get("stockup_id") or "").strip() or "-"
-            note = "post ok %s: stockup %s" % (now_ts(), sid)
+            rc.log("queue: doc %s POSTED (stockup %s)"
+                   % (doc_id, (d.get("stockup_id") or "").strip() or "-"))
+        elif st == "queued":
+            msg = ((d.get("error_msg") or "").strip()
+                   or sub_err or "nie zaksiegowano")
+            rc.log("queue: doc %s still queued after run -> error (%s)"
+                   % (doc_id, msg[:120]))
+            if d and d.get("_row"):
+                rc.set_cell(wsD, hdrD, d["_row"], "status", "error")
+                if not (d.get("error_msg") or "").strip():
+                    rc.set_cell(wsD, hdrD, d["_row"], "error_msg", msg[:300])
+                rc.set_cell(wsD, hdrD, d["_row"], "updated_at", now_ts())
         else:
-            msg = ((d.get("error_msg") or "").strip() if d
-                   else "dokument nie znaleziony")
-            if not msg:
-                msg = sub_err or ("nie zaksiegowano (status=%s)" % (st or "?"))
-            note = "post error %s: %s" % (now_ts(), msg[:180])
+            rc.log("queue: doc %s finished with status=%s%s"
+                   % (doc_id, st or "?",
+                      (" (" + sub_err + ")") if sub_err else ""))
     except Exception as e:
-        note = "post error %s: %s" % (now_ts(), (sub_err or str(e))[:180])
-    try:
-        _stamp_control(row_num, {"post_note": note, "updated_at": now_ts()})
-        rc.log("if-requested: post result stamped -> %s" % note)
-    except Exception as e:
-        rc.log("if-requested: post result stamp FAILED: %s" % e)
+        rc.log("queue: verdict re-read failed for %s: %s" % (doc_id, e))
 
 
 def _claim_rescan(row, row_num, dry):
@@ -1379,9 +1400,9 @@ def main():
         if dry_req:
             _run_post_dry(dry_req[0], dry_req[1], ctrl_row, args.dry)
         if post_req:
-            # post-button: this tick is post-targeted; no scan/rescan (they
+            # post-queue: this tick is post-targeted; no scan/rescan (they
             # stayed unclaimed and will be picked up by the next tick).
-            _run_post_live(post_req[0], post_req[1], ctrl_row, args.dry)
+            _run_post_live(post_req[0], post_req[1], args.dry)
             return 0
         if rescan_req:
             # batch5 task4: targeted re-parse of ONE doc with a forced route.
@@ -1605,7 +1626,9 @@ def main():
         for d in pool:
             st = (d.get("status") or "").strip()
             if args.force:
-                if st in ("posted", "posting"):
+                # post-queue: "queued" tez pomijamy - force-reparse nie moze
+                # przepisac dokumentu czekajacego w kolejce przyjecia.
+                if st in ("posted", "posting", "queued"):
                     continue
                 todo.append(d)
             elif st in ("parsing", "new"):

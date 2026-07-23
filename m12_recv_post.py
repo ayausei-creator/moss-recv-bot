@@ -747,8 +747,11 @@ def main():
     for l in line_rows:
         lines_by_doc.setdefault(l.get("doc_id"), []).append(l)
 
+    # post-queue: "queued" = dokument zaklikany w konsoli ("Przyjmij na
+    # magazyn"), pobierany przez trigger; "approved" zostaje dla recznego
+    # (awaryjnego) uruchomienia CLI. Logika kolejki NIE mieszka tutaj.
     approved = [d for d in doc_rows
-                if (d.get("status") or "").strip() == "approved"
+                if (d.get("status") or "").strip() in ("approved", "queued")
                 and (not args.doc or d.get("doc_id") == args.doc)]
     approved = approved[:args.limit]
     rc.log("post: %d approved document(s) to process" % len(approved))
